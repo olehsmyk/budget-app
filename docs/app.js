@@ -116,6 +116,7 @@ const monthLabel = (key) =>
 const monthShort = (key) => monthDate(key).toLocaleDateString('en', { month: 'short' });
 const shortDate = (iso) =>
   C.fromISO(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+const dayMonth = (iso) => C.fromISO(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
 // For saved moments like "last backup": the date it was here, not the UTC date.
 const shortMoment = (timestamp) => shortDate(C.toISO(new Date(timestamp)));
 
@@ -775,7 +776,7 @@ function sheetRecurring() {
               ${badge(c)}
               <span class="tx-main">
                 <div class="tx-title">${r.note || c.name}</div>
-                <div class="tx-sub">${FREQ_LABEL[r.freq]} · ${w.name} · next ${shortDate(C.nextOccurrence(r))}</div>
+                <div class="tx-sub">Next ${dayMonth(C.nextOccurrence(r))} · ${FREQ_LABEL[r.freq]} · ${w.name}</div>
               </span>
               <span class="tx-amount ${r.type}">${r.type === 'income' ? '+' : '−'}${money(r.amount, w.currency)}</span>
             </button>`;
