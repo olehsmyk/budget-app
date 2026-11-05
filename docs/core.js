@@ -19,33 +19,53 @@ export const addMonths = (key, n) => {
 
 // ---------- Default data ----------
 
+// Colors are stored by name so each can have its own light and dark shade (see styles.css).
+export const COLOR_KEYS = [
+  'blue', 'orange', 'aqua', 'yellow', 'magenta', 'green', 'violet', 'red', 'sky', 'lime', 'plum', 'brown', 'gray',
+];
+
+// The color used least so far, so new items look different from existing ones.
+// Gray is left out because it reads as "other", not as a color of its own.
+export function nextColor(items) {
+  const uses = (key) => items.filter((item) => item.color === key).length;
+  return COLOR_KEYS.filter((key) => key !== 'gray').reduce((best, key) => (uses(key) < uses(best) ? key : best));
+}
+
 const DEFAULT_CATEGORIES = [
-  ['Groceries', '🛒', 'expense'],
-  ['Eating out', '🍽️', 'expense'],
-  ['Transport', '🚌', 'expense'],
-  ['Housing', '🏠', 'expense'],
-  ['Utilities', '💡', 'expense'],
-  ['Health', '💊', 'expense'],
-  ['Shopping', '🛍️', 'expense'],
-  ['Entertainment', '🎬', 'expense'],
-  ['Subscriptions', '🔁', 'expense'],
-  ['Other', '📦', 'expense'],
-  ['Salary', '💼', 'income'],
-  ['Freelance', '🧾', 'income'],
-  ['Other income', '💰', 'income'],
+  ['Groceries', 'shopping-cart', 'green', 'expense', '🛒'],
+  ['Eating out', 'utensils', 'orange', 'expense', '🍽️'],
+  ['Transport', 'bus', 'blue', 'expense', '🚌'],
+  ['Housing', 'house', 'violet', 'expense', '🏠'],
+  ['Utilities', 'lightbulb', 'yellow', 'expense', '💡'],
+  ['Health', 'pill', 'red', 'expense', '💊'],
+  ['Shopping', 'shopping-bag', 'magenta', 'expense', '🛍️'],
+  ['Entertainment', 'clapperboard', 'sky', 'expense', '🎬'],
+  ['Subscriptions', 'repeat', 'plum', 'expense', '🔁'],
+  ['Other', 'package', 'gray', 'expense', '📦'],
+  ['Salary', 'briefcase', 'green', 'income', '💼'],
+  ['Freelance', 'receipt', 'blue', 'income', '🧾'],
+  ['Other income', 'coins', 'yellow', 'income', '💰'],
 ];
 
 export function defaultState(nowISO) {
   return {
     app: 'budget',
-    version: 1,
+    version: 2,
+    // The currency totals, charts and budget limits are shown in.
     currency: 'USD',
+    // How much 1 unit of each other currency is worth in `currency`.
+    rates: {},
+    ratesUpdated: null,
+    autoRates: true,
     createdAt: nowISO,
     lastBackup: null,
-    categories: DEFAULT_CATEGORIES.map(([name, icon, kind], i) => ({
+    lastWalletId: 'w0',
+    wallets: [{ id: 'w0', name: 'Main', icon: 'wallet', color: 'blue', currency: 'USD', opening: 0, archived: false }],
+    categories: DEFAULT_CATEGORIES.map(([name, icon, color, kind], i) => ({
       id: `c${i}`,
       name,
       icon,
+      color,
       kind,
       limit: null,
       archived: false,
@@ -55,21 +75,64 @@ export function defaultState(nowISO) {
   };
 }
 
+// Version 1 had a single currency, no wallets, and emoji for icons. Everything moves into one wallet
+// in that currency. Default categories get their matching icon, and any others a generic one.
+function migrateV1(o) {
+  const wallet = { id: 'w0', name: 'Main', icon: 'wallet', color: 'blue', currency: o.currency, opening: 0, archived: false };
+  const categories = [];
+  for (const c of o.categories) {
+    const match = DEFAULT_CATEGORIES.find((d) => d[4] === c.icon);
+    categories.push({
+      ...c,
+      icon: match ? match[1] : 'tag',
+      color: match ? match[2] : nextColor(categories),
+    });
+  }
+  return {
+    ...o,
+    version: 2,
+    rates: {},
+    ratesUpdated: null,
+    autoRates: true,
+    lastWalletId: wallet.id,
+    wallets: [wallet],
+    categories,
+    tx: o.tx.map((t) => ({ ...t, walletId: wallet.id })),
+    recurring: o.recurring.map((r) => ({ ...r, walletId: wallet.id })),
+  };
+}
+
 // Throws if the object is not a usable backup, so a bad file can never replace good data.
-export function validateBackup(o) {
+// Returns the data in the current format.
+export function validateBackup(input) {
   const fail = (why) => {
     throw new Error(`Not a valid backup: ${why}`);
   };
   const isDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
   const isAmount = (n) => Number.isSafeInteger(n) && n > 0;
   const isType = (t) => t === 'income' || t === 'expense';
+  const isCurrency = (c) => /^[A-Z]{3}$/.test(c);
 
-  if (!o || o.app !== 'budget') fail('this file was not made by this app');
-  if (!Array.isArray(o.categories) || !Array.isArray(o.tx) || !Array.isArray(o.recurring)) {
+  if (!input || input.app !== 'budget') fail('this file was not made by this app');
+  if (!Array.isArray(input.categories) || !Array.isArray(input.tx) || !Array.isArray(input.recurring)) {
     fail('missing data lists');
   }
-  if (!/^[A-Z]{3}$/.test(o.currency)) fail('bad currency');
+  if (!isCurrency(input.currency)) fail('bad currency');
+  const o = input.version >= 2 ? input : migrateV1(input);
 
+  if (!Array.isArray(o.wallets) || !o.wallets.length) fail('no wallets');
+  if (!o.rates || typeof o.rates !== 'object') fail('bad exchange rates');
+  for (const r of Object.values(o.rates)) {
+    if (!(Number.isFinite(r) && r > 0)) fail('bad exchange rate');
+  }
+
+  const walletIds = new Set();
+  for (const w of o.wallets) {
+    if (!w.id || typeof w.name !== 'string' || !isCurrency(w.currency) || !Number.isSafeInteger(w.opening)) {
+      fail('bad wallet');
+    }
+    walletIds.add(w.id);
+  }
   const ids = new Set();
   for (const c of o.categories) {
     if (!c.id || typeof c.name !== 'string' || !isType(c.kind)) fail('bad category');
@@ -77,7 +140,10 @@ export function validateBackup(o) {
     ids.add(c.id);
   }
   for (const t of o.tx) {
-    if (!t.id || !isDate(t.date) || !isAmount(t.amount) || !isType(t.type) || !ids.has(t.categoryId)) {
+    if (!t.id || !isDate(t.date) || !isAmount(t.amount) || !walletIds.has(t.walletId)) fail('bad transaction');
+    if (t.type === 'transfer') {
+      if (!walletIds.has(t.toWalletId) || !isAmount(t.toAmount)) fail('bad transfer');
+    } else if (!isType(t.type) || !ids.has(t.categoryId)) {
       fail('bad transaction');
     }
   }
@@ -88,12 +154,62 @@ export function validateBackup(o) {
       !isAmount(r.amount) ||
       !isType(r.type) ||
       !ids.has(r.categoryId) ||
+      !walletIds.has(r.walletId) ||
       !['weekly', 'monthly', 'yearly'].includes(r.freq)
     ) {
       fail('bad recurring item');
     }
   }
   return o;
+}
+
+// ---------- Exchange rates ----------
+
+// Converts minor units into the display currency. Returns null when there is no rate for it.
+export function convert(state, cents, from) {
+  if (from === state.currency) return cents;
+  const rate = state.rates[from];
+  return rate ? Math.round(cents * rate) : null;
+}
+
+// How many units of `to` one unit of `from` buys, or null when a rate is missing.
+export function crossRate(state, from, to) {
+  const inDisplay = (code) => (code === state.currency ? 1 : state.rates[code]);
+  const a = inDisplay(from);
+  const b = inDisplay(to);
+  return a && b ? a / b : null;
+}
+
+export function parseRate(input) {
+  const s = String(input ?? '').replace(/\s/g, '').replace(',', '.');
+  const n = Number(s);
+  return s && Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// `usdRates` is units of each currency per 1 USD, as the rates service returns them.
+// Currencies the service does not cover keep the rate the user set.
+export function applyLiveRates(state, usdRates, nowISO) {
+  const base = usdRates[state.currency];
+  if (!base) return false;
+  for (const [code, perUsd] of Object.entries(usdRates)) {
+    if (code !== state.currency && perUsd > 0) state.rates[code] = base / perUsd;
+  }
+  state.ratesUpdated = nowISO;
+  return true;
+}
+
+// `rate` is what 1 unit of `next` is worth in the current display currency.
+// Budget limits are amounts of money, so they convert too rather than keeping the same number.
+export function changeDisplayCurrency(state, next, rate) {
+  const rates = { [state.currency]: 1 / rate };
+  for (const [code, value] of Object.entries(state.rates)) {
+    if (code !== next) rates[code] = value / rate;
+  }
+  state.rates = rates;
+  state.currency = next;
+  for (const c of state.categories) {
+    if (c.limit) c.limit = Math.max(1, Math.round(c.limit / rate));
+  }
 }
 
 // ---------- Money ----------
@@ -164,6 +280,7 @@ export function applyRecurring(state, today) {
         date,
         type: rule.type,
         amount: rule.amount,
+        walletId: rule.walletId,
         categoryId: rule.categoryId,
         note: rule.note,
         recurringId: rule.id,
@@ -182,27 +299,64 @@ export const sortTx = (list) =>
 
 export const txInMonth = (txs, key) => txs.filter((t) => monthOf(t.date) === key);
 
-export function totals(txs) {
-  const out = { income: 0, expense: 0 };
-  for (const t of txs) out[t.type] += t.amount;
-  return out;
-}
-
-export function spentByCategory(txs) {
-  const out = new Map();
+// Income and spending in the display currency. Transfers only move money, so they count as neither.
+export function summarize(state, txs) {
+  const currencies = new Map(state.wallets.map((w) => [w.id, w.currency]));
+  const out = { income: 0, expense: 0, byCategory: new Map(), missing: new Set(), converted: false };
   for (const t of txs) {
-    if (t.type === 'expense') out.set(t.categoryId, (out.get(t.categoryId) || 0) + t.amount);
+    if (t.type === 'transfer') continue;
+    const from = currencies.get(t.walletId);
+    const value = convert(state, t.amount, from);
+    if (value === null) {
+      out.missing.add(from);
+      continue;
+    }
+    if (from !== state.currency) out.converted = true;
+    out[t.type] += value;
+    if (t.type === 'expense') out.byCategory.set(t.categoryId, (out.byCategory.get(t.categoryId) || 0) + value);
   }
   return out;
 }
 
-export function trend(txs, endKey, months) {
+export function trend(state, endKey, months) {
   const rows = [];
   for (let i = months - 1; i >= 0; i--) {
     const key = addMonths(endKey, -i);
-    rows.push({ key, ...totals(txInMonth(txs, key)) });
+    const { income, expense } = summarize(state, txInMonth(state.tx, key));
+    rows.push({ key, income, expense });
   }
   return rows;
+}
+
+// Each wallet's balance in its own currency.
+export function balances(state) {
+  const out = new Map(state.wallets.map((w) => [w.id, w.opening]));
+  const add = (id, cents) => out.set(id, out.get(id) + cents);
+  for (const t of state.tx) {
+    if (t.type === 'transfer') {
+      add(t.walletId, -t.amount);
+      add(t.toWalletId, t.toAmount);
+    } else {
+      add(t.walletId, t.type === 'income' ? t.amount : -t.amount);
+    }
+  }
+  return out;
+}
+
+// The sum of all visible wallets in the display currency.
+export function netWorth(state) {
+  const bal = balances(state);
+  const out = { total: 0, missing: new Set(), converted: false };
+  for (const w of state.wallets) {
+    if (w.archived) continue;
+    const value = convert(state, bal.get(w.id), w.currency);
+    if (value === null) out.missing.add(w.currency);
+    else {
+      out.total += value;
+      if (w.currency !== state.currency) out.converted = true;
+    }
+  }
+  return out;
 }
 
 export function niceMax(value) {
@@ -227,15 +381,22 @@ const unguardFormula = (s) => (/^'[=+\-@\t\r]/.test(s) ? s.slice(1) : s);
 
 export function toCSV(state) {
   const names = new Map(state.categories.map((c) => [c.id, c.name]));
-  const rows = [['date', 'type', 'amount', 'currency', 'category', 'note']];
+  const wallets = new Map(state.wallets.map((w) => [w.id, w]));
+  const rows = [['date', 'type', 'wallet', 'amount', 'currency', 'category', 'note', 'to_wallet', 'to_amount', 'to_currency']];
   for (const t of sortTx(state.tx)) {
+    const from = wallets.get(t.walletId);
+    const to = wallets.get(t.toWalletId);
     rows.push([
       t.date,
       t.type,
+      guardFormula(from.name),
       (t.amount / 100).toFixed(2),
-      state.currency,
+      from.currency,
       guardFormula(names.get(t.categoryId) || ''),
       guardFormula(t.note || ''),
+      to ? guardFormula(to.name) : '',
+      to ? (t.toAmount / 100).toFixed(2) : '',
+      to ? to.currency : '',
     ]);
   }
   return rows.map((r) => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
@@ -291,6 +452,8 @@ export const IMPORT_FIELDS = {
   amount: /amount|sum|value|price|total|сума/i,
   category: /categ|катег/i,
   type: /^type$|kind|transaction.?type|income.?expense|тип/i,
+  wallet: /wallet|account|гаман|рахун/i,
+  currency: /^curr|валют/i,
   note: /note|memo|desc|comment|title|payee|merchant|name|нотат|опис/i,
 };
 
@@ -328,12 +491,20 @@ export function detectDateFormats(values) {
 
 const INCOME_WORDS = /inc|credit|earn|revenue|salary|deposit|дох/i;
 const EXPENSE_WORDS = /exp|debit|spend|cost|payment|витр/i;
+const TRANSFER_WORDS = /transfer|переказ/i;
 
-export function buildImport(rows, map, fmt, categories) {
+// Rows go to the wallet named in the file, or to `defaultWalletId` when the file names none.
+// A row whose currency differs from its wallet is skipped: its amount would be silently wrong.
+export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId) {
   const known = new Map(categories.map((c) => [`${c.kind}:${c.name.toLowerCase()}`, c.id]));
+  const walletByName = new Map(wallets.map((w) => [w.name.toLowerCase(), w]));
+  const defaultWallet = wallets.find((w) => w.id === defaultWalletId);
   const newCategories = [];
+  const newWallets = [];
   const tx = [];
   let skipped = 0;
+  let transfers = 0;
+  let mismatched = 0;
   const cell = (row, field) => (map[field] >= 0 ? String(row[map[field]] ?? '').trim() : '');
   const hasNegatives = rows.some((r) => parseAmount(cell(r, 'amount')) < 0);
 
@@ -345,6 +516,34 @@ export function buildImport(rows, map, fmt, categories) {
       continue;
     }
     const typeCell = cell(row, 'type');
+    // A transfer needs both sides to be correct, so it is reported rather than guessed at.
+    if (TRANSFER_WORDS.test(typeCell)) {
+      transfers++;
+      continue;
+    }
+
+    const currencyCell = cell(row, 'currency').toUpperCase();
+    const rowCurrency = /^[A-Z]{3}$/.test(currencyCell) ? currencyCell : null;
+    const walletName = unguardFormula(cell(row, 'wallet'));
+    let wallet = walletName ? walletByName.get(walletName.toLowerCase()) : defaultWallet;
+    if (rowCurrency && wallet && wallet.currency !== rowCurrency) {
+      mismatched++;
+      continue;
+    }
+    if (!wallet) {
+      wallet = {
+        id: uid(),
+        name: walletName,
+        icon: 'wallet',
+        color: nextColor([...wallets, ...newWallets]),
+        currency: rowCurrency || defaultWallet.currency,
+        opening: 0,
+        archived: false,
+      };
+      walletByName.set(walletName.toLowerCase(), wallet);
+      newWallets.push(wallet);
+    }
+
     let type;
     if (INCOME_WORDS.test(typeCell)) type = 'income';
     else if (EXPENSE_WORDS.test(typeCell)) type = 'expense';
@@ -357,16 +556,18 @@ export function buildImport(rows, map, fmt, categories) {
     if (!known.has(key)) {
       const id = uid();
       known.set(key, id);
-      newCategories.push({ id, name, icon: '🏷️', kind: type, limit: null, archived: false });
+      const color = nextColor([...categories, ...newCategories]);
+      newCategories.push({ id, name, icon: 'tag', color, kind: type, limit: null, archived: false });
     }
     tx.push({
       id: uid(),
       date,
       type,
       amount: Math.abs(amount),
+      walletId: wallet.id,
       categoryId: known.get(key),
       note: unguardFormula(cell(row, 'note')),
     });
   }
-  return { tx, newCategories, skipped };
+  return { tx, newCategories, newWallets, skipped, transfers, mismatched };
 }

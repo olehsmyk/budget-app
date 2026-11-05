@@ -1,10 +1,14 @@
 import * as C from './core.js';
+import { CATEGORY_ICONS } from './category-icons.js';
 
 const KEY = 'budget.v1';
-const CURRENCIES = ['USD', 'EUR', 'GBP', 'UAH', 'PLN', 'CZK', 'CHF', 'SEK', 'NOK', 'DKK', 'CAD', 'AUD', 'JPY'];
+const COMMON_CURRENCIES = ['USD', 'EUR', 'UAH', 'IDR', 'GBP', 'PLN', 'CZK', 'CHF', 'SEK', 'NOK', 'DKK', 'CAD', 'AUD', 'JPY'];
+const RATES_URL = 'https://open.er-api.com/v6/latest/USD';
+const RATES_MAX_AGE_MS = 24 * 3600 * 1000; // The service only publishes new rates once a day.
 const BACKUP_REMINDER_DAYS = 30;
 const SEARCH_LIMIT = 200;
 const TREND_MONTHS = 6;
+const ICON_KEYS = Object.keys(CATEGORY_ICONS);
 
 const today = () => C.toISO(new Date());
 const $ = (id) => document.getElementById(id);
@@ -32,7 +36,14 @@ function load() {
   const raw = localStorage.getItem(KEY);
   if (!raw) return C.defaultState(today());
   try {
-    return C.validateBackup(JSON.parse(raw));
+    const saved = JSON.parse(raw);
+    const loaded = C.validateBackup(saved);
+    if (saved.version < 2) {
+      // Keep an untouched copy of the old format, then store the upgraded one.
+      localStorage.setItem(`${KEY}.before-wallets`, raw);
+      localStorage.setItem(KEY, JSON.stringify(loaded));
+    }
+    return loaded;
   } catch {
     // Never overwrite data we could not read: park it under another key.
     localStorage.setItem(`${KEY}.unreadable`, raw);
@@ -41,7 +52,7 @@ function load() {
 }
 
 let state = load();
-const ui = { tab: 'home', month: C.monthOf(today()), search: '', filterCat: '', sheet: null };
+const ui = { tab: 'home', month: C.monthOf(today()), search: '', filterCat: '', filterWallet: '', donutCat: null, sheet: null };
 
 function save() {
   try {
@@ -59,11 +70,30 @@ function runRecurring() {
 
 const category = (id) => state.categories.find((c) => c.id === id);
 const activeCategories = (kind) => state.categories.filter((c) => c.kind === kind && !c.archived);
+const wallet = (id) => state.wallets.find((w) => w.id === id);
+const activeWallets = () => state.wallets.filter((w) => !w.archived);
+const otherWallet = (id) => activeWallets().find((w) => w.id !== id)?.id ?? null;
+const defaultWalletId = () => (wallet(state.lastWalletId)?.archived === false ? state.lastWalletId : activeWallets()[0].id);
+const walletInUse = (id) =>
+  state.tx.some((t) => t.walletId === id || t.toWalletId === id) || state.recurring.some((r) => r.walletId === id);
+
+// A wallet's currency, plus the one already chosen on a form even if that wallet is now hidden.
+const walletChoices = (selectedId) => {
+  const selected = wallet(selectedId);
+  return selected?.archived ? [...activeWallets(), selected] : activeWallets();
+};
 
 // ---------- Formatting ----------
 
-const money = (cents) =>
-  new Intl.NumberFormat(undefined, { style: 'currency', currency: state.currency }).format(cents / 100);
+// Intl shows two decimals for these, but nobody uses fractions of them in practice.
+const WHOLE_NUMBER_CURRENCIES = new Set(['IDR']);
+
+const money = (cents, currency = state.currency) =>
+  new Intl.NumberFormat(undefined, {
+    style: 'currency',
+    currency,
+    ...(WHOLE_NUMBER_CURRENCIES.has(currency) && { minimumFractionDigits: 0, maximumFractionDigits: 0 }),
+  }).format(cents / 100);
 const moneyCompact = (cents) =>
   new Intl.NumberFormat(undefined, {
     style: 'currency',
@@ -72,12 +102,17 @@ const moneyCompact = (cents) =>
     minimumFractionDigits: 0,
     maximumFractionDigits: 1,
   }).format(cents / 100);
+const moneyRounded = (cents) =>
+  new Intl.NumberFormat(undefined, { style: 'currency', currency: state.currency, minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(cents / 100);
+const formatRate = (rate) => String(Number(rate.toPrecision(6)));
 const monthDate = (key) => C.fromISO(`${key}-01`);
 const monthLabel = (key) =>
   monthDate(key).toLocaleDateString('en', { month: 'long', year: 'numeric' });
 const monthShort = (key) => monthDate(key).toLocaleDateString('en', { month: 'short' });
 const shortDate = (iso) =>
   C.fromISO(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+// For saved moments like "last backup": the date it was here, not the UTC date.
+const shortMoment = (timestamp) => shortDate(C.toISO(new Date(timestamp)));
 
 function dayLabel(iso) {
   const now = new Date();
@@ -101,7 +136,19 @@ const ICONS = {
   plus: 'M12 5v14M5 12h14',
   left: 'M15 5l-7 7 7 7',
   right: 'M9 5l7 7-7 7',
+  swap: 'M7 4L3 8l4 4M3 8h14M17 12l4 4-4 4M21 16H7',
 };
+
+// Icon and color names can come from an imported file, so both are looked up, never inserted as given.
+const colorClass = (key) => `c-${C.COLOR_KEYS.includes(key) ? key : 'gray'}`;
+const iconMarkup = (key) =>
+  new Raw(
+    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${
+      CATEGORY_ICONS[ICON_KEYS.includes(key) ? key : 'tag']
+    }</svg>`,
+  );
+const badge = (item, size = '') =>
+  html`<span class="badge ${colorClass(item.color)} ${size}" aria-hidden="true">${iconMarkup(item.icon)}</span>`;
 
 // ---------- Shared pieces ----------
 
@@ -114,17 +161,32 @@ const monthNav = () => {
   </div>`;
 };
 
-const txRow = (t) => {
+function txRow(t) {
+  const w = wallet(t.walletId);
+  if (t.type === 'transfer') {
+    const to = wallet(t.toWalletId);
+    return html`<button class="tx" data-a="editTx" data-id="${t.id}">
+      <span class="tx-icon" aria-hidden="true">${svg(ICONS.swap)}</span>
+      <span class="tx-main">
+        <div class="tx-title">${t.note || 'Transfer'}</div>
+        <div class="tx-sub">${w.name} → ${to.name}</div>
+      </span>
+      <span class="tx-amount">${money(t.amount, w.currency)}
+        ${w.currency !== to.currency && html`<div class="tx-sub">→ ${money(t.toAmount, to.currency)}</div>`}
+      </span>
+    </button>`;
+  }
   const c = category(t.categoryId);
+  const details = [t.note && c.name, state.wallets.length > 1 && w.name, t.recurringId && 'Recurring'].filter(Boolean);
   return html`<button class="tx" data-a="editTx" data-id="${t.id}">
-    <span class="tx-icon" aria-hidden="true">${c.icon}</span>
+    ${badge(c)}
     <span class="tx-main">
       <div class="tx-title">${t.note || c.name}</div>
-      <div class="tx-sub">${t.note ? c.name : ''}${t.recurringId ? `${t.note ? ' · ' : ''}Recurring` : ''}</div>
+      <div class="tx-sub">${details.join(' · ')}</div>
     </span>
-    <span class="tx-amount ${t.type}">${t.type === 'income' ? '+' : '−'}${money(t.amount)}</span>
+    <span class="tx-amount ${t.type}">${t.type === 'income' ? '+' : '−'}${money(t.amount, w.currency)}</span>
   </button>`;
-};
+}
 
 const txGroups = (list) => {
   const days = new Map();
@@ -147,6 +209,27 @@ const leftText = (spent, limit) =>
     ? html`<span class="over-text">${money(spent - limit)} over</span>`
     : html`${money(limit - spent)} left`;
 
+const approx = (converted) => (converted ? '≈\u00a0' : '');
+
+// Large totals, common in currencies like UAH and IDR, shrink to stay on one line.
+const heroAmount = (text) => {
+  const size = text.length <= 11 ? '' : text.length <= 15 ? 'hero-medium' : 'hero-small';
+  return html`<div class="hero-amount ${size}">${text}</div>`;
+};
+
+const missingRateNote = (missing) =>
+  missing.size > 0 &&
+  html`<button class="missing-rate" data-a="openRates">
+    No exchange rate for ${[...missing].join(', ')}, so it isn't counted here. <b>Set a rate</b>
+  </button>`;
+
+function currencyOptions(selected) {
+  const all = Intl.supportedValuesOf?.('currency') ?? [];
+  return [...new Set([selected, ...COMMON_CURRENCIES, ...all])].map(
+    (code) => html`<option ${code === selected ? 'selected' : ''}>${code}</option>`,
+  );
+}
+
 // ---------- Home ----------
 
 function banners() {
@@ -166,30 +249,61 @@ function banners() {
   return out;
 }
 
+function walletsCard() {
+  const worth = C.netWorth(state);
+  const bal = C.balances(state);
+  return html`<section class="card">
+    <div class="row-between">
+      <h2 class="section-title">All my money</h2>
+      <button class="link" data-a="openWallets">Edit</button>
+    </div>
+    <div>
+      <label class="total-label">Total in
+        <select class="total-select" data-change="currency" aria-label="Total currency">${currencyOptions(state.currency)}</select>
+      </label>
+      ${heroAmount(approx(worth.converted) + money(worth.total))}
+    </div>
+    ${missingRateNote(worth.missing)}
+    <div class="wallet-list">${activeWallets().map((w) => {
+      const value = C.convert(state, bal.get(w.id), w.currency);
+      return html`<button class="tx" data-a="openWallet" data-id="${w.id}">
+        ${badge(w)}
+        <span class="tx-main">
+          <div class="tx-title">${w.name}</div>
+          ${w.currency !== state.currency &&
+          html`<div class="tx-sub">${value === null ? 'No rate yet' : `≈ ${money(value)}`}</div>`}
+        </span>
+        <span class="tx-amount">${money(bal.get(w.id), w.currency)}</span>
+      </button>`;
+    })}</div>
+    <button class="btn" data-a="newTransfer">Move money</button>
+  </section>`;
+}
+
 function viewHome() {
   const list = C.sortTx(C.txInMonth(state.tx, ui.month));
-  const { income, expense } = C.totals(list);
-  const spent = C.spentByCategory(list);
+  const { income, expense, byCategory, missing, converted } = C.summarize(state, list);
   const limited = state.categories
     .filter((c) => c.kind === 'expense' && c.limit && !c.archived)
-    .map((c) => ({ c, spent: spent.get(c.id) || 0 }))
+    .map((c) => ({ c, spent: byCategory.get(c.id) || 0 }))
     .sort((a, b) => b.spent / b.c.limit - a.spent / a.c.limit);
   const totalLimit = limited.reduce((sum, x) => sum + x.c.limit, 0);
   const limitedSpent = limited.reduce((sum, x) => sum + x.spent, 0);
   const net = income - expense;
 
-  return html`${banners()}${monthNav()}
+  return html`${banners()}${walletsCard()}${monthNav()}
     <section class="card">
       <div>
         <div class="hero-label">Spent</div>
-        <div class="hero-amount">${money(expense)}</div>
+        ${heroAmount(approx(converted) + money(expense))}
       </div>
       ${totalLimit > 0 && html`${budgetBar(limitedSpent, totalLimit)}
         <div class="small">${leftText(limitedSpent, totalLimit)} of ${money(totalLimit)} budgeted</div>`}
       <div class="stats">
-        <div><div class="small">Income</div><div class="stat-value">${money(income)}</div></div>
-        <div><div class="small">Net</div><div class="stat-value">${net < 0 ? '−' : ''}${money(Math.abs(net))}</div></div>
+        <div><div class="small">Income</div><div class="stat-value">${approx(converted)}${money(income)}</div></div>
+        <div><div class="small">Net</div><div class="stat-value">${approx(converted)}${net < 0 ? '−' : ''}${money(Math.abs(net))}</div></div>
       </div>
+      ${missingRateNote(missing)}
     </section>
 
     <section class="card">
@@ -201,7 +315,7 @@ function viewHome() {
         ? limited.map(
             (x) => html`<div class="budget-row">
               <div class="row-between">
-                <span class="budget-name">${x.c.icon} ${x.c.name}</span>
+                <span class="budget-name">${badge(x.c, 'badge-small')} ${x.c.name}</span>
                 <span class="small">${leftText(x.spent, x.c.limit)}</span>
               </div>
               ${budgetBar(x.spent, x.c.limit)}
@@ -230,8 +344,12 @@ function activityResults() {
   const q = ui.search.trim().toLowerCase();
   let list = q ? state.tx : C.txInMonth(state.tx, ui.month);
   if (ui.filterCat) list = list.filter((t) => t.categoryId === ui.filterCat);
+  if (ui.filterWallet) list = list.filter((t) => t.walletId === ui.filterWallet || t.toWalletId === ui.filterWallet);
   if (q) {
-    list = list.filter((t) => `${t.note || ''} ${category(t.categoryId).name}`.toLowerCase().includes(q));
+    list = list.filter((t) => {
+      const label = t.type === 'transfer' ? 'transfer' : category(t.categoryId).name;
+      return `${t.note || ''} ${label} ${wallet(t.walletId).name}`.toLowerCase().includes(q);
+    });
   }
   const sorted = C.sortTx(list);
   const shown = sorted.slice(0, q ? SEARCH_LIMIT : undefined);
@@ -241,9 +359,23 @@ function activityResults() {
 }
 
 function viewActivity() {
-  return html`${!ui.search.trim() && monthNav()}
+  const w = wallet(ui.filterWallet);
+  return html`${w && html`<section class="card">
+      <div class="row-between">
+        <span class="budget-name">${badge(w, 'badge-small')} ${w.name}</span>
+        <button class="link" data-a="editWallet" data-id="${w.id}">Edit</button>
+      </div>
+      ${heroAmount(money(C.balances(state).get(w.id), w.currency))}
+    </section>`}
+    ${!ui.search.trim() && monthNav()}
     <div class="filters">
       <input id="search" class="input" type="search" placeholder="Search all months" aria-label="Search all months" value="${ui.search}">
+      <select class="input" data-change="filterWallet" aria-label="Filter by wallet">
+        <option value="">All wallets</option>
+        ${state.wallets.map(
+          (x) => html`<option value="${x.id}" ${x.id === ui.filterWallet ? 'selected' : ''}>${x.name}</option>`,
+        )}
+      </select>
       <select class="input" data-change="filterCat" aria-label="Filter by category">
         <option value="">All categories</option>
         ${state.categories.map(
@@ -308,33 +440,64 @@ function trendChart(rows) {
   </svg>`;
 }
 
+function donut(spent, total, converted) {
+  const R = 80;
+  const CIRCUMFERENCE = 2 * Math.PI * R;
+  const GAP = spent.length > 1 ? 2 : 0;
+  const chosen = spent.find((x) => x.c.id === ui.donutCat);
+  const shown = chosen ? chosen.amount : total;
+  const rounded = approx(converted) + moneyRounded(shown);
+  const center = rounded.length <= 14 ? rounded : approx(converted) + moneyCompact(shown);
+  let offset = 0;
+  const slices = spent.map((x) => {
+    const length = (x.amount / total) * CIRCUMFERENCE;
+    const dash = Math.max(length - GAP, 1);
+    const slice = html`<circle class="slice ${colorClass(x.c.color)} ${chosen && chosen !== x ? 'dim' : ''}"
+      cx="100" cy="100" r="${R}" stroke-dasharray="${dash} ${CIRCUMFERENCE - dash}" stroke-dashoffset="${-offset}"
+      transform="rotate(-90 100 100)" data-a="pickSlice" data-id="${x.c.id}" role="button"
+      aria-label="${x.c.name}: ${money(x.amount)}"></circle>`;
+    offset += length;
+    return slice;
+  });
+  return html`<div class="donut">
+    <svg viewBox="0 0 200 200" role="group" aria-label="Spending by category">${slices}</svg>
+    <div class="donut-center">
+      <div class="small">${chosen ? chosen.c.name : 'Spent'}</div>
+      <div class="donut-amount ${center.length > 10 ? 'donut-amount-long' : ''}">${center}</div>
+      ${chosen && html`<div class="small">${percent(chosen.amount, total)}</div>`}
+    </div>
+  </div>`;
+}
+
+const percent = (part, whole) => (part / whole < 0.01 ? '<1%' : `${Math.round((part / whole) * 100)}%`);
+
 function viewInsights() {
-  const list = C.txInMonth(state.tx, ui.month);
-  const spent = [...C.spentByCategory(list)]
+  const s = C.summarize(state, C.txInMonth(state.tx, ui.month));
+  const spent = [...s.byCategory]
     .map(([id, amount]) => ({ c: category(id), amount }))
     .sort((a, b) => b.amount - a.amount);
   const total = spent.reduce((sum, x) => sum + x.amount, 0);
   const top = spent[0]?.amount || 1;
-  const rows = C.trend(state.tx, trendEnd(), TREND_MONTHS);
+  const rows = C.trend(state, trendEnd(), TREND_MONTHS);
   const chosen = rows.find((r) => r.key === ui.month);
 
   return html`${monthNav()}
     <section class="card">
-      <div class="row-between">
-        <h2 class="section-title">Spending</h2>
-        <span class="small">${money(total)}</span>
-      </div>
+      <h2 class="section-title">Spending</h2>
       ${spent.length
-        ? spent.map(
-            (x) => html`<button class="cat-bar" data-a="openCat" data-id="${x.c.id}">
+        ? html`${donut(spent, total, s.converted)}
+          ${spent.map(
+            (x) => html`<button class="cat-bar ${colorClass(x.c.color)}" data-a="openCat" data-id="${x.c.id}">
               <div class="row-between">
-                <span class="budget-name">${x.c.icon} ${x.c.name}</span>
-                <span class="small">${money(x.amount)} · ${x.amount / total < 0.01 ? '<1' : Math.round((x.amount / total) * 100)}%</span>
+                <span class="budget-name">${badge(x.c, 'badge-small')} ${x.c.name}</span>
+                <span class="small">${money(x.amount)} · ${percent(x.amount, total)}</span>
               </div>
               <div class="bar"><i style="width:${((x.amount / top) * 100).toFixed(1)}%"></i></div>
             </button>`,
-          )
+          )}`
         : html`<p class="small">No spending this month.</p>`}
+      ${s.converted && html`<p class="small">Converted to ${state.currency} at your current exchange rates.</p>`}
+      ${missingRateNote(s.missing)}
     </section>
 
     <section class="card">
@@ -359,15 +522,19 @@ function viewInsights() {
 
 // ---------- Settings ----------
 
+function ratesStatus() {
+  if (!state.autoRates) return 'Set by you';
+  return state.ratesUpdated ? `Updated ${shortMoment(state.ratesUpdated)}` : 'Not updated yet';
+}
+
 function viewSettings() {
-  const currencies = CURRENCIES.includes(state.currency) ? CURRENCIES : [state.currency, ...CURRENCIES];
   return html`<h1 class="section-title" style="font-size:28px">Settings</h1>
     <section class="card card-flush">
-      <label class="set-row"><span>Currency</span>
-        <select class="input" data-change="currency" aria-label="Currency">
-          ${currencies.map((c) => html`<option ${c === state.currency ? 'selected' : ''}>${c}</option>`)}
-        </select>
+      <label class="set-row"><span>Total currency</span>
+        <select class="input" data-change="currency" aria-label="Total currency">${currencyOptions(state.currency)}</select>
       </label>
+      <button class="set-row" data-a="openRates"><span>Exchange rates</span><span class="value">${ratesStatus()} ›</span></button>
+      <button class="set-row" data-a="openWallets"><span>Wallets</span><span class="value">${activeWallets().length} ›</span></button>
       <button class="set-row" data-a="openCategories"><span>Categories and limits</span><span class="chev">›</span></button>
       <button class="set-row" data-a="openRecurring"><span>Recurring</span>
         <span class="value">${state.recurring.length} ›</span></button>
@@ -376,11 +543,11 @@ function viewSettings() {
     <section class="card card-flush">
       <button class="set-row" data-a="exportCsv"><span>Export to CSV</span><span class="value">For spreadsheets</span></button>
       <button class="set-row" data-a="backup"><span>Back up everything</span>
-        <span class="value">${state.lastBackup ? `Last: ${shortDate(state.lastBackup.slice(0, 10))}` : 'Never'}</span></button>
+        <span class="value">${state.lastBackup ? `Last: ${shortMoment(state.lastBackup)}` : 'Never'}</span></button>
       <label class="set-row" for="restore-json"><span>Restore from backup</span><span class="chev">›</span></label>
       <label class="set-row" for="import-csv"><span>Import from another app (CSV)</span><span class="chev">›</span></label>
     </section>
-    <p class="small">${state.tx.length} ${state.tx.length === 1 ? 'entry' : 'entries'}, stored only on this device. Nothing is sent anywhere. Deleting the app deletes this data, so keep a backup in Files or iCloud Drive.</p>`;
+    <p class="small">${state.tx.length} ${state.tx.length === 1 ? 'entry' : 'entries'}, stored only on this device. The only thing the app downloads is exchange rates, and that sends none of your data. Deleting the app deletes this data, so keep a backup in Files or iCloud Drive.</p>`;
 }
 
 // ---------- Sheets ----------
@@ -398,27 +565,77 @@ const seg = (action, value, options) =>
   )}</div>`;
 
 const TYPE_OPTIONS = [['expense', 'Expense'], ['income', 'Income']];
+const TX_TYPE_OPTIONS = [...TYPE_OPTIONS, ['transfer', 'Transfer']];
+
+const walletSelect = (id, label, selectedId, change) =>
+  html`<label class="field"><span>${label}</span>
+    <select id="${id}" class="input" data-change="${change}">${walletChoices(selectedId).map(
+      (w) => html`<option value="${w.id}" ${w.id === selectedId ? 'selected' : ''}>${w.name} (${w.currency})</option>`,
+    )}</select>
+  </label>`;
 
 function sheetTx(s) {
   const f = s.form;
+  const from = wallet(f.walletId);
+  const footer = html`<label class="field"><span>Date</span><input id="f-date" class="input" type="date" value="${f.date}"></label>
+    <label class="field"><span>Note (optional)</span><input id="f-note" class="input" maxlength="120" value="${f.note}"></label>
+    ${s.id && html`<button class="btn btn-danger" data-a="deleteTx">Delete entry</button>`}`;
+  const amount = html`<div>
+    <input id="f-amount" class="amount-input" inputmode="decimal" autocomplete="off" placeholder="0.00" aria-label="Amount in ${from.currency}" value="${f.amount}">
+    <p class="amount-currency">${from.currency}</p>
+  </div>`;
+
+  if (f.type === 'transfer') {
+    const to = wallet(f.toWalletId);
+    const rate = to && C.crossRate(state, from.currency, to.currency);
+    return html`${sheetHead(s.id ? 'Edit transfer' : 'Move money', 'closeSheet', 'Cancel', 'saveTx')}
+      <div class="sheet-body">
+        ${seg('txType', f.type, TX_TYPE_OPTIONS)}
+        ${amount}
+        ${s.error && html`<p class="error">${s.error}</p>`}
+        ${walletSelect('f-wallet', 'From', f.walletId, 'txForm')}
+        ${to
+          ? walletSelect('f-to', 'To', f.toWalletId, 'txForm')
+          : html`<p class="small">You need a second wallet to move money.</p>
+            <button class="btn" data-a="openWallets">Add a wallet</button>`}
+        ${to && to.currency !== from.currency && html`<label class="field"><span>Amount received (${to.currency})</span>
+            <input id="f-to-amount" class="input" inputmode="decimal" autocomplete="off" placeholder="0.00" value="${f.toAmount}"></label>
+          <p class="small">${rate
+            ? `Filled in using 1 ${from.currency} = ${formatRate(rate)} ${to.currency}. Change it to match what you actually received.`
+            : 'No exchange rate saved, so enter what you received.'}</p>`}
+        ${footer}
+      </div>`;
+  }
+
   const cats = activeCategories(f.type);
   const current = category(f.categoryId);
   // An archived category stays selectable when editing an old entry that uses it.
   const choices = current && current.kind === f.type && current.archived ? [...cats, current] : cats;
   return html`${sheetHead(s.id ? 'Edit entry' : 'New entry', 'closeSheet', 'Cancel', 'saveTx')}
     <div class="sheet-body">
-      ${seg('txType', f.type, TYPE_OPTIONS)}
-      <input id="f-amount" class="amount-input" inputmode="decimal" autocomplete="off" placeholder="0.00" aria-label="Amount" value="${f.amount}">
+      ${seg('txType', f.type, TX_TYPE_OPTIONS)}
+      ${amount}
       ${s.error && html`<p class="error">${s.error}</p>`}
+      ${walletSelect('f-wallet', 'Wallet', f.walletId, 'txForm')}
       <div class="cat-grid">${choices.map(
         (c) => html`<button type="button" class="cat" data-a="txCat" data-id="${c.id}" aria-pressed="${c.id === f.categoryId}">
-          <b aria-hidden="true">${c.icon}</b>${c.name}</button>`,
+          ${badge(c)}${c.name}</button>`,
       )}</div>
-      <label class="field"><span>Date</span><input id="f-date" class="input" type="date" value="${f.date}"></label>
-      <label class="field"><span>Note (optional)</span><input id="f-note" class="input" maxlength="120" value="${f.note}"></label>
-      ${s.id && html`<button class="btn btn-danger" data-a="deleteTx">Delete entry</button>`}
+      ${footer}
     </div>`;
 }
+
+const stylePicker = (f) =>
+  html`<div class="field"><span>Color</span>
+      <div class="swatches">${C.COLOR_KEYS.map(
+        (key) => html`<button type="button" class="swatch ${colorClass(key)}" data-a="pickColor" data-v="${key}" aria-label="${key}" aria-pressed="${key === f.color}"></button>`,
+      )}</div>
+    </div>
+    <div class="field"><span>Icon</span>
+      <div class="icon-grid ${colorClass(f.color)}">${ICON_KEYS.map(
+        (key) => html`<button type="button" class="icon-choice" data-a="pickIcon" data-v="${key}" aria-label="${key}" aria-pressed="${key === f.icon}">${iconMarkup(key)}</button>`,
+      )}</div>
+    </div>`;
 
 function sheetCategories(s) {
   const list = state.categories.filter((c) => c.kind === s.kind);
@@ -428,7 +645,7 @@ function sheetCategories(s) {
       ${seg('catKind', s.kind, TYPE_OPTIONS)}
       <div class="card card-flush">${sorted.map(
         (c) => html`<button class="set-row" data-a="editCategory" data-id="${c.id}">
-          <span>${c.icon} ${c.name}</span>
+          <span class="budget-name">${badge(c, 'badge-small')} ${c.name}</span>
           <span class="value">${c.archived ? 'Hidden' : c.limit ? `${money(c.limit)} / month` : ''} ›</span>
         </button>`,
       )}</div>
@@ -441,14 +658,79 @@ function sheetCategory(s) {
   return html`${sheetHead(s.id ? 'Edit category' : 'New category', 'openCategories', 'Back', 'saveCategory')}
     <div class="sheet-body">
       ${s.error && html`<p class="error">${s.error}</p>`}
-      <div style="display:grid;grid-template-columns:80px 1fr;gap:12px">
-        <label class="field"><span>Icon</span><input id="f-icon" class="input" style="text-align:center" maxlength="8" value="${f.icon}"></label>
+      <div class="name-row">
+        ${badge(f, 'badge-large')}
         <label class="field"><span>Name</span><input id="f-name" class="input" maxlength="40" value="${f.name}"></label>
       </div>
-      ${s.kind === 'expense' && html`<label class="field"><span>Monthly limit (optional)</span>
+      ${s.kind === 'expense' && html`<label class="field"><span>Monthly limit in ${state.currency} (optional)</span>
         <input id="f-limit" class="input" inputmode="decimal" autocomplete="off" placeholder="No limit" value="${f.limit}"></label>`}
+      ${stylePicker(f)}
       ${s.id && html`<button class="btn" data-a="toggleArchive">${f.archived ? 'Show category again' : 'Hide category'}</button>
         <p class="small">Hiding removes it from the picker. Past entries keep it.</p>`}
+    </div>`;
+}
+
+function sheetWallets() {
+  const bal = C.balances(state);
+  const sorted = [...activeWallets(), ...state.wallets.filter((w) => w.archived)];
+  return html`${sheetHead('Wallets', 'closeSheet', 'Done')}
+    <div class="sheet-body">
+      <div class="card card-flush">${sorted.map(
+        (w) => html`<button class="set-row" data-a="editWallet" data-id="${w.id}">
+          <span class="budget-name">${badge(w, 'badge-small')} ${w.name}</span>
+          <span class="value">${w.archived ? 'Hidden' : money(bal.get(w.id), w.currency)} ›</span>
+        </button>`,
+      )}</div>
+      <button class="btn" data-a="newWallet">Add wallet</button>
+    </div>`;
+}
+
+function sheetWallet(s) {
+  const f = s.form;
+  const used = s.id && walletInUse(s.id);
+  return html`${sheetHead(s.id ? 'Edit wallet' : 'New wallet', 'openWallets', 'Back', 'saveWallet')}
+    <div class="sheet-body">
+      ${s.error && html`<p class="error">${s.error}</p>`}
+      <div class="name-row">
+        ${badge(f, 'badge-large')}
+        <label class="field"><span>Name</span><input id="f-name" class="input" maxlength="40" placeholder="Savings for car" value="${f.name}"></label>
+      </div>
+      <div class="two-col">
+        <label class="field"><span>Currency</span>
+          <select id="f-currency" class="input" ${used ? 'disabled' : ''}>${currencyOptions(f.currency)}</select>
+        </label>
+        <label class="field"><span>Starting balance</span>
+          <input id="f-opening" class="input" inputmode="text" autocomplete="off" placeholder="0.00" value="${f.opening}">
+        </label>
+      </div>
+      ${used && html`<p class="small">The currency can't change once a wallet has entries, because they'd no longer be correct.</p>`}
+      ${stylePicker(f)}
+      ${s.id && (used
+        ? html`<button class="btn" data-a="toggleWalletHidden">${f.archived ? 'Show wallet again' : 'Hide wallet'}</button>
+          <p class="small">A hidden wallet isn't counted in your total. Its history stays.</p>`
+        : html`<button class="btn btn-danger" data-a="deleteWallet">Delete wallet</button>`)}
+    </div>`;
+}
+
+function sheetRates() {
+  const codes = [...new Set(activeWallets().map((w) => w.currency))].filter((c) => c !== state.currency).sort();
+  return html`${sheetHead('Exchange rates', 'closeSheet', 'Done')}
+    <div class="sheet-body">
+      ${seg('rateMode', state.autoRates ? 'auto' : 'manual', [['auto', 'Automatic'], ['manual', 'Set by me']])}
+      ${state.autoRates
+        ? html`<p class="small">${state.ratesUpdated ? `Updated ${shortMoment(state.ratesUpdated)}. ` : ''}New rates download once a day when you're online. Offline, the last rates keep working.</p>
+          <button class="btn" data-a="updateRates">Update now</button>`
+        : html`<p class="small">Only the rates below are used. Nothing changes until you edit them.</p>`}
+      ${codes.length
+        ? html`<div class="card card-flush">${codes.map((code) => {
+            const rate = state.rates[code];
+            return html`<label class="set-row rate-row"><span>1 ${code} =</span>
+              <input class="input" inputmode="decimal" autocomplete="off" placeholder="Enter rate" data-change="rate" data-code="${code}" aria-label="Value of 1 ${code} in ${state.currency}" value="${rate ? formatRate(rate) : ''}">
+              <span>${state.currency}</span></label>`;
+          })}</div>
+          <p class="small">Editing a rate switches to Set by me, so your number stays as you typed it.</p>`
+        : html`<p class="small">All your wallets use ${state.currency}, so no rates are needed yet.</p>`}
+      <p class="small"><a href="https://www.exchangerate-api.com" target="_blank" rel="noopener">Rates By Exchange Rate API</a></p>
     </div>`;
 }
 
@@ -460,13 +742,14 @@ function sheetRecurring() {
       ${state.recurring.length
         ? html`<div class="card card-flush">${state.recurring.map((r) => {
             const c = category(r.categoryId);
+            const w = wallet(r.walletId);
             return html`<button class="tx" data-a="editRule" data-id="${r.id}">
-              <span class="tx-icon" aria-hidden="true">${c.icon}</span>
+              ${badge(c)}
               <span class="tx-main">
                 <div class="tx-title">${r.note || c.name}</div>
-                <div class="tx-sub">${FREQ_LABEL[r.freq]} · next ${shortDate(C.nextOccurrence(r))}</div>
+                <div class="tx-sub">${FREQ_LABEL[r.freq]} · ${w.name} · next ${shortDate(C.nextOccurrence(r))}</div>
               </span>
-              <span class="tx-amount ${r.type}">${r.type === 'income' ? '+' : '−'}${money(r.amount)}</span>
+              <span class="tx-amount ${r.type}">${r.type === 'income' ? '+' : '−'}${money(r.amount, w.currency)}</span>
             </button>`;
           })}</div>`
         : html`<p class="small">Rent, subscriptions and salary can be added automatically each time they come due.</p>`}
@@ -480,10 +763,11 @@ function sheetRule(s) {
     <div class="sheet-body">
       ${seg('ruleType', f.type, TYPE_OPTIONS)}
       ${s.error && html`<p class="error">${s.error}</p>`}
-      <label class="field"><span>Amount</span><input id="f-amount" class="input" inputmode="decimal" autocomplete="off" placeholder="0.00" value="${f.amount}"></label>
+      ${walletSelect('f-wallet', 'Wallet', f.walletId, 'ruleForm')}
+      <label class="field"><span>Amount (${wallet(f.walletId).currency})</span><input id="f-amount" class="input" inputmode="decimal" autocomplete="off" placeholder="0.00" value="${f.amount}"></label>
       <label class="field"><span>Category</span>
         <select id="f-cat" class="input">${activeCategories(f.type).map(
-          (c) => html`<option value="${c.id}" ${c.id === f.categoryId ? 'selected' : ''}>${c.icon} ${c.name}</option>`,
+          (c) => html`<option value="${c.id}" ${c.id === f.categoryId ? 'selected' : ''}>${c.name}</option>`,
         )}</select>
       </label>
       <label class="field"><span>Note (optional)</span><input id="f-note" class="input" maxlength="120" placeholder="Rent" value="${f.note}"></label>
@@ -504,14 +788,30 @@ function sheetRule(s) {
 const DATE_FORMATS = { ymd: 'Year-Month-Day', dmy: 'Day-Month-Year', mdy: 'Month-Day-Year' };
 
 function sheetImport(s) {
-  const fields = [['date', 'Date'], ['amount', 'Amount'], ['category', 'Category'], ['type', 'Income or expense'], ['note', 'Note']];
-  const result = C.buildImport(s.rows, s.map, s.fmt, state.categories);
+  const fields = [
+    ['date', 'Date'],
+    ['amount', 'Amount'],
+    ['category', 'Category'],
+    ['type', 'Income or expense'],
+    ['wallet', 'Wallet'],
+    ['currency', 'Currency'],
+    ['note', 'Note'],
+  ];
+  const result = C.buildImport(s.rows, s.map, s.fmt, state.categories, state.wallets, s.walletId);
   const fits = C.detectDateFormats(s.map.date >= 0 ? s.rows.map((r) => r[s.map.date]) : []);
   const ready = s.map.date >= 0 && s.map.amount >= 0 && result.tx.length > 0;
+  const allWallets = [...state.wallets, ...result.newWallets];
+  const allCategories = [...state.categories, ...result.newCategories];
+  const skips = [
+    result.skipped && `${result.skipped} with no valid date or amount`,
+    result.mismatched && `${result.mismatched} in a different currency from their wallet`,
+    result.transfers && `${result.transfers} ${result.transfers === 1 ? 'transfer' : 'transfers'}`,
+  ].filter(Boolean);
   return html`${sheetHead('Import CSV', 'closeSheet', 'Cancel', ready && 'confirmImport', 'Import')}
     <div class="sheet-body">
       <p class="small">Match your file's columns. ${s.rows.length} rows found.</p>
       <div class="card">
+        ${walletSelect('f-import-wallet', 'Rows with no wallet go into', s.walletId, 'importWallet')}
         ${fields.map(
           ([field, label]) => html`<label class="field"><span>${label}${field === 'date' || field === 'amount' ? '' : ' (optional)'}</span>
             <select class="input" data-change="importMap" data-field="${field}">
@@ -528,12 +828,15 @@ function sheetImport(s) {
         ${fits.length > 1 && html`<p class="small">These dates fit more than one format. Check the preview below.</p>`}
       </div>
       <div class="card">
-        <strong>${result.tx.length} entries ready${result.skipped ? `, ${result.skipped} rows skipped (no valid date or amount)` : ''}</strong>
+        <strong>${result.tx.length} entries ready</strong>
+        ${skips.length > 0 && html`<p class="small">Skipped: ${skips.join(', ')}.</p>`}
+        ${result.newWallets.length > 0 && html`<p class="small">New wallets: ${result.newWallets.map((w) => `${w.name} (${w.currency})`).join(', ')}</p>`}
         ${result.newCategories.length > 0 && html`<p class="small">New categories: ${result.newCategories.map((c) => c.name).join(', ')}</p>`}
         <div class="preview">${result.tx.slice(0, 4).map((t) => {
-          const name = result.newCategories.find((c) => c.id === t.categoryId)?.name || category(t.categoryId).name;
+          const name = allCategories.find((c) => c.id === t.categoryId).name;
+          const w = allWallets.find((x) => x.id === t.walletId);
           return html`<div><span>${shortDate(t.date)} · ${name}${t.note ? ` · ${t.note}` : ''}</span>
-            <span>${t.type === 'income' ? '+' : '−'}${money(t.amount)}</span></div>`;
+            <span>${t.type === 'income' ? '+' : '−'}${money(t.amount, w.currency)}</span></div>`;
         })}</div>
       </div>
     </div>`;
@@ -543,6 +846,9 @@ const SHEETS = {
   tx: sheetTx,
   categories: sheetCategories,
   category: sheetCategory,
+  wallets: sheetWallets,
+  wallet: sheetWallet,
+  rates: sheetRates,
   recurring: sheetRecurring,
   rule: sheetRule,
   import: sheetImport,
@@ -595,6 +901,38 @@ function toast(message, undoSnapshot) {
 
 const snapshot = () => JSON.stringify(state);
 
+// ---------- Exchange rates ----------
+
+async function refreshRates({ force = false } = {}) {
+  if (!force) {
+    const age = state.ratesUpdated ? Date.now() - Date.parse(state.ratesUpdated) : Infinity;
+    if (!state.autoRates || age < RATES_MAX_AGE_MS) return false;
+  }
+  try {
+    const response = await fetch(RATES_URL);
+    const data = await response.json();
+    if (data.result !== 'success' || !C.applyLiveRates(state, data.rates, new Date().toISOString())) return false;
+  } catch {
+    return false; // Offline: the last saved rates keep working.
+  }
+  save();
+  // Redrawing an open form would throw away what is being typed.
+  if (!ui.sheet) render();
+  return true;
+}
+
+function setDisplayCurrency(next) {
+  if (next === state.currency) return;
+  const rate = state.rates[next] ?? C.parseRate(prompt(`No rate saved yet. 1 ${next} is worth how many ${state.currency}?`));
+  if (rate) {
+    C.changeDisplayCurrency(state, next, rate);
+    save();
+  } else {
+    toast(`${next} needs an exchange rate first.`);
+  }
+  render();
+}
+
 // ---------- Files ----------
 
 async function deliverFile(name, type, text) {
@@ -625,7 +963,7 @@ function startImport(text) {
   }
   const map = C.guessMapping(headers);
   const fits = map.date >= 0 ? C.detectDateFormats(rows.map((r) => r[map.date])) : [];
-  openSheet({ type: 'import', headers, rows, map, fmt: fits[0] || 'ymd' });
+  openSheet({ type: 'import', headers, rows, map, fmt: fits[0] || 'ymd', walletId: defaultWalletId() });
 }
 
 function startRestore(text) {
@@ -643,6 +981,7 @@ function startRestore(text) {
   runRecurring();
   save();
   ui.filterCat = '';
+  ui.filterWallet = '';
   render();
   toast(`Restored ${next.tx.length} entries.`, before);
 }
@@ -652,12 +991,25 @@ function startRestore(text) {
 function readTxForm() {
   const f = ui.sheet.form;
   f.amount = $('f-amount').value;
+  f.walletId = $('f-wallet').value;
   f.date = $('f-date').value;
   f.note = $('f-note').value;
+  if ($('f-to')) f.toWalletId = $('f-to').value;
+  if ($('f-to-amount')) f.toAmount = $('f-to-amount').value;
+}
+
+// Fills in "amount received" from the rate, until the user types their own number.
+function fillReceived(f) {
+  if (f.toEdited) return;
+  const to = wallet(f.toWalletId);
+  const rate = to && C.crossRate(state, wallet(f.walletId).currency, to.currency);
+  const cents = Math.abs(C.parseAmount(f.amount) ?? 0);
+  f.toAmount = rate && cents ? C.centsToInput(Math.round(cents * rate)) : '';
 }
 
 function readRuleForm() {
   const f = ui.sheet.form;
+  f.walletId = $('f-wallet').value;
   f.amount = $('f-amount').value;
   f.categoryId = $('f-cat').value;
   f.note = $('f-note').value;
@@ -665,7 +1017,25 @@ function readRuleForm() {
   f.start = $('f-date').value;
 }
 
+// Keeps what has been typed when a tap redraws the category or wallet form.
+function readStyleForm() {
+  const f = ui.sheet.form;
+  f.name = $('f-name').value;
+  if ($('f-limit')) f.limit = $('f-limit').value;
+  if ($('f-currency')) f.currency = $('f-currency').value;
+  if ($('f-opening')) f.opening = $('f-opening').value;
+}
+
 const openCategoryList = (kind = 'expense') => openSheet({ type: 'categories', kind });
+
+function openTxForm(type) {
+  const walletId = defaultWalletId();
+  openSheet({
+    type: 'tx',
+    form: { type, amount: '', walletId, toWalletId: otherWallet(walletId), toAmount: '', toEdited: false, categoryId: null, date: today(), note: '' },
+  });
+  $('f-amount').focus();
+}
 
 const actions = {
   tab({ tab }) {
@@ -676,18 +1046,32 @@ const actions = {
   },
   monthPrev() {
     ui.month = C.addMonths(ui.month, -1);
+    ui.donutCat = null;
     render();
   },
   monthNext() {
     ui.month = C.addMonths(ui.month, 1);
+    ui.donutCat = null;
     render();
   },
   pickMonth({ key }) {
     ui.month = key;
+    ui.donutCat = null;
+    render();
+  },
+  pickSlice({ id }) {
+    ui.donutCat = ui.donutCat === id ? null : id;
     render();
   },
   openCat({ id }) {
     ui.filterCat = id;
+    ui.filterWallet = '';
+    ui.search = '';
+    actions.tab({ tab: 'activity' });
+  },
+  openWallet({ id }) {
+    ui.filterWallet = id;
+    ui.filterCat = '';
     ui.search = '';
     actions.tab({ tab: 'activity' });
   },
@@ -698,18 +1082,27 @@ const actions = {
 
   // Entries
   newTx() {
-    openSheet({
-      type: 'tx',
-      form: { type: 'expense', amount: '', categoryId: null, date: today(), note: '' },
-    });
-    $('f-amount').focus();
+    openTxForm('expense');
+  },
+  newTransfer() {
+    openTxForm('transfer');
   },
   editTx({ id }) {
     const t = state.tx.find((x) => x.id === id);
     openSheet({
       type: 'tx',
       id,
-      form: { type: t.type, amount: C.centsToInput(t.amount), categoryId: t.categoryId, date: t.date, note: t.note || '' },
+      form: {
+        type: t.type,
+        amount: C.centsToInput(t.amount),
+        walletId: t.walletId,
+        toWalletId: t.toWalletId ?? otherWallet(t.walletId),
+        toAmount: t.toAmount ? C.centsToInput(t.toAmount) : '',
+        toEdited: Boolean(t.toAmount),
+        categoryId: t.categoryId ?? null,
+        date: t.date,
+        note: t.note || '',
+      },
     });
   },
   txType({ v }) {
@@ -717,6 +1110,7 @@ const actions = {
     const f = ui.sheet.form;
     if (f.type !== v) f.categoryId = null;
     f.type = v;
+    if (v === 'transfer') fillReceived(f);
     render();
   },
   txCat({ id }, el) {
@@ -728,22 +1122,45 @@ const actions = {
     const s = ui.sheet;
     const f = s.form;
     const amount = Math.abs(C.parseAmount(f.amount) ?? 0);
+    const isTransfer = f.type === 'transfer';
+    const to = isTransfer ? wallet(f.toWalletId) : null;
+    const sameCurrency = to?.currency === wallet(f.walletId).currency;
+    const toAmount = sameCurrency ? amount : Math.abs(C.parseAmount(f.toAmount) ?? 0);
+
     if (!amount) s.error = 'Enter an amount.';
-    else if (!f.categoryId) s.error = 'Pick a category.';
+    else if (isTransfer && !to) s.error = 'Add a second wallet first.';
+    else if (isTransfer && f.toWalletId === f.walletId) s.error = 'Pick two different wallets.';
+    else if (isTransfer && !toAmount) s.error = 'Enter the amount received.';
+    else if (!isTransfer && !f.categoryId) s.error = 'Pick a category.';
     else if (!f.date) s.error = 'Pick a date.';
     else s.error = null;
     if (s.error) {
       render();
       return;
     }
-    const data = { date: f.date, type: f.type, amount, categoryId: f.categoryId, note: f.note.trim() };
-    if (s.id) Object.assign(state.tx.find((t) => t.id === s.id), data);
-    else state.tx.push({ id: C.uid(), ...data });
+
+    const existing = s.id ? state.tx.find((t) => t.id === s.id) : null;
+    const entry = {
+      id: s.id ?? C.uid(),
+      date: f.date,
+      type: f.type,
+      amount,
+      walletId: f.walletId,
+      note: f.note.trim(),
+      ...(isTransfer
+        ? { toWalletId: f.toWalletId, toAmount }
+        : { categoryId: f.categoryId, ...(existing?.recurringId && { recurringId: existing.recurringId }) }),
+    };
+    if (existing) state.tx[state.tx.indexOf(existing)] = entry;
+    else state.tx.push(entry);
+    state.lastWalletId = f.walletId;
     save();
     ui.month = C.monthOf(f.date);
     ui.sheet = null;
     render();
-    toast(s.id ? 'Entry updated.' : `Added ${money(amount)}.`);
+    const shown = money(amount, wallet(f.walletId).currency);
+    if (s.id) toast('Entry updated.');
+    else toast(isTransfer ? `Moved ${shown} to ${to.name}.` : `Added ${shown}.`);
   },
   deleteTx() {
     const before = snapshot();
@@ -752,6 +1169,18 @@ const actions = {
     ui.sheet = null;
     render();
     toast('Entry deleted.', before);
+  },
+
+  // Colors and icons, shared by categories and wallets
+  pickColor({ v }) {
+    readStyleForm();
+    ui.sheet.form.color = v;
+    render();
+  },
+  pickIcon({ v }) {
+    readStyleForm();
+    ui.sheet.form.icon = v;
+    render();
   },
 
   // Categories
@@ -765,7 +1194,7 @@ const actions = {
     openSheet({
       type: 'category',
       kind: ui.sheet.kind,
-      form: { icon: '🏷️', name: '', limit: '', archived: false },
+      form: { icon: 'tag', color: C.nextColor(state.categories), name: '', limit: '', archived: false },
     });
   },
   editCategory({ id }) {
@@ -774,16 +1203,16 @@ const actions = {
       type: 'category',
       id,
       kind: c.kind,
-      form: { icon: c.icon, name: c.name, limit: c.limit ? C.centsToInput(c.limit) : '', archived: c.archived },
+      form: { icon: c.icon, color: c.color, name: c.name, limit: c.limit ? C.centsToInput(c.limit) : '', archived: c.archived },
     });
   },
   saveCategory() {
+    readStyleForm();
     const s = ui.sheet;
-    const name = $('f-name').value.trim();
-    const icon = $('f-icon').value.trim() || '🏷️';
-    const limitText = s.kind === 'expense' ? $('f-limit').value.trim() : '';
+    const f = s.form;
+    const name = f.name.trim();
+    const limitText = s.kind === 'expense' ? f.limit.trim() : '';
     const limit = limitText ? Math.abs(C.parseAmount(limitText) ?? 0) : null;
-    s.form = { ...s.form, name, icon, limit: limitText };
     if (!name) s.error = 'Enter a name.';
     else if (limitText && !limit) s.error = 'Enter a valid limit, or leave it empty.';
     else if (state.categories.some((c) => c.kind === s.kind && c.id !== s.id && c.name.toLowerCase() === name.toLowerCase())) {
@@ -793,7 +1222,7 @@ const actions = {
       render();
       return;
     }
-    const data = { name, icon, limit, archived: s.form.archived };
+    const data = { name, icon: f.icon, color: f.color, limit, archived: f.archived };
     if (s.id) Object.assign(category(s.id), data);
     else state.categories.push({ id: C.uid(), kind: s.kind, ...data });
     save();
@@ -807,6 +1236,94 @@ const actions = {
     openCategoryList(s.kind);
   },
 
+  // Wallets
+  openWallets() {
+    openSheet({ type: 'wallets' });
+  },
+  newWallet() {
+    openSheet({
+      type: 'wallet',
+      form: { icon: 'wallet', color: C.nextColor(state.wallets), name: '', currency: state.currency, opening: '', archived: false },
+    });
+  },
+  editWallet({ id }) {
+    const w = wallet(id);
+    openSheet({
+      type: 'wallet',
+      id,
+      form: { icon: w.icon, color: w.color, name: w.name, currency: w.currency, opening: w.opening ? C.centsToInput(w.opening) : '', archived: w.archived },
+    });
+  },
+  saveWallet() {
+    readStyleForm();
+    const s = ui.sheet;
+    const f = s.form;
+    const name = f.name.trim();
+    const openingText = f.opening.trim();
+    const opening = openingText ? C.parseAmount(openingText) : 0;
+    if (!name) s.error = 'Enter a name.';
+    else if (opening === null) s.error = 'Enter a valid balance, or leave it empty.';
+    else if (state.wallets.some((w) => w.id !== s.id && w.name.toLowerCase() === name.toLowerCase())) {
+      s.error = 'A wallet with this name already exists.';
+    } else s.error = null;
+    if (s.error) {
+      render();
+      return;
+    }
+    const data = { name, icon: f.icon, color: f.color, currency: f.currency, opening, archived: f.archived };
+    if (s.id) Object.assign(wallet(s.id), data);
+    else state.wallets.push({ id: C.uid(), ...data });
+    save();
+    openSheet({ type: 'wallets' });
+  },
+  toggleWalletHidden() {
+    const s = ui.sheet;
+    const w = wallet(s.id);
+    if (!w.archived && activeWallets().length === 1) s.error = 'You need at least one visible wallet.';
+    else if (!w.archived && state.recurring.some((r) => r.walletId === w.id)) s.error = 'Stop its recurring items first.';
+    else s.error = null;
+    if (s.error) {
+      readStyleForm();
+      render();
+      return;
+    }
+    w.archived = !w.archived;
+    if (ui.filterWallet === w.id) ui.filterWallet = '';
+    save();
+    openSheet({ type: 'wallets' });
+  },
+  deleteWallet() {
+    const s = ui.sheet;
+    if (activeWallets().length === 1) {
+      readStyleForm();
+      s.error = 'You need at least one wallet.';
+      render();
+      return;
+    }
+    const before = snapshot();
+    state.wallets = state.wallets.filter((w) => w.id !== s.id);
+    if (ui.filterWallet === s.id) ui.filterWallet = '';
+    save();
+    openSheet({ type: 'wallets' });
+    toast('Wallet deleted.', before);
+  },
+
+  // Exchange rates
+  openRates() {
+    openSheet({ type: 'rates' });
+  },
+  async rateMode({ v }) {
+    state.autoRates = v === 'auto';
+    save();
+    render();
+    if (state.autoRates) await actions.updateRates();
+  },
+  async updateRates() {
+    const updated = await refreshRates({ force: true });
+    render();
+    toast(updated ? 'Exchange rates updated.' : "Couldn't get new rates. Check your connection.");
+  },
+
   // Recurring
   openRecurring() {
     openSheet({ type: 'recurring' });
@@ -816,6 +1333,7 @@ const actions = {
       type: 'rule',
       form: {
         type: 'expense',
+        walletId: defaultWalletId(),
         amount: '',
         categoryId: activeCategories('expense')[0]?.id,
         note: '',
@@ -829,7 +1347,7 @@ const actions = {
     openSheet({
       type: 'rule',
       id,
-      form: { type: r.type, amount: C.centsToInput(r.amount), categoryId: r.categoryId, note: r.note, freq: r.freq, start: r.start },
+      form: { type: r.type, walletId: r.walletId, amount: C.centsToInput(r.amount), categoryId: r.categoryId, note: r.note, freq: r.freq, start: r.start },
     });
   },
   ruleType({ v }) {
@@ -852,7 +1370,7 @@ const actions = {
       render();
       return;
     }
-    const data = { type: f.type, amount, categoryId: f.categoryId, note: f.note.trim(), freq: f.freq, start: f.start };
+    const data = { type: f.type, walletId: f.walletId, amount, categoryId: f.categoryId, note: f.note.trim(), freq: f.freq, start: f.start };
     if (s.id) Object.assign(state.recurring.find((r) => r.id === s.id), data);
     else state.recurring.push({ id: C.uid(), lastRun: null, ...data });
     const added = runRecurring();
@@ -883,8 +1401,9 @@ const actions = {
   confirmImport() {
     const s = ui.sheet;
     const before = snapshot();
-    const { tx, newCategories } = C.buildImport(s.rows, s.map, s.fmt, state.categories);
+    const { tx, newCategories, newWallets } = C.buildImport(s.rows, s.map, s.fmt, state.categories, state.wallets, s.walletId);
     state.categories.push(...newCategories);
+    state.wallets.push(...newWallets);
     state.tx.push(...tx);
     save();
     ui.sheet = null;
@@ -907,9 +1426,38 @@ const changes = {
     ui.filterCat = el.value;
     render();
   },
+  filterWallet(el) {
+    ui.filterWallet = el.value;
+    render();
+  },
   currency(el) {
-    state.currency = el.value;
-    save();
+    setDisplayCurrency(el.value);
+  },
+  rate(el) {
+    const rate = C.parseRate(el.value);
+    if (rate) {
+      state.rates[el.dataset.code] = rate;
+      state.autoRates = false;
+      save();
+    } else {
+      toast('Enter a number above zero.');
+    }
+    render();
+  },
+  txForm() {
+    readTxForm();
+    const f = ui.sheet.form;
+    if (f.toWalletId === f.walletId) f.toWalletId = otherWallet(f.walletId);
+    f.toEdited = false;
+    fillReceived(f);
+    render();
+  },
+  ruleForm() {
+    readRuleForm();
+    render();
+  },
+  importWallet(el) {
+    ui.sheet.walletId = el.value;
     render();
   },
   importMap(el) {
@@ -939,6 +1487,13 @@ document.addEventListener('change', (e) => {
 });
 
 document.addEventListener('input', (e) => {
+  const form = ui.sheet?.form;
+  if (form && e.target.id === 'f-to-amount') form.toEdited = true;
+  if (form && e.target.id === 'f-amount' && $('f-to-amount')) {
+    form.amount = e.target.value;
+    fillReceived(form);
+    if (!form.toEdited) $('f-to-amount').value = form.toAmount;
+  }
   if (e.target.id !== 'search') return;
   const hadQuery = Boolean(ui.search.trim());
   ui.search = e.target.value;
@@ -963,12 +1518,15 @@ $('restore-json').addEventListener('change', (e) => readPicked(e.target, startRe
 
 // The app may stay open in the background for days, so check for due items whenever it returns.
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && !ui.sheet && runRecurring()) render();
+  if (document.visibilityState !== 'visible') return;
+  if (!ui.sheet && runRecurring()) render();
+  refreshRates();
 });
 
 const added = runRecurring();
 render();
 if (added) toast(`Added ${added} recurring ${added === 1 ? 'entry' : 'entries'}.`);
+refreshRates();
 
 navigator.storage?.persist?.();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
