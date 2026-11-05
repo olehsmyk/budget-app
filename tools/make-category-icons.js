@@ -15,6 +15,8 @@ const NAMES = [
   'repeat', 'package', 'tag', 'globe', 'tree-palm', 'umbrella',
   'baby', 'users', 'dog', 'cat', 'paw-print',
   'wallet', 'piggy-bank', 'landmark', 'credit-card', 'banknote', 'coins', 'briefcase', 'receipt',
+  'car-taxi-front', 'hand-heart', 'hand-coins', 'handshake', 'file-text', 'badge-percent', 'trending-up',
+  'laptop', 'headphones', 'camera', 'palette', 'spray-can', 'sofa', 'luggage', 'star', 'shapes', 'store', 'archive',
 ];
 
 const packageDir = process.argv[2];

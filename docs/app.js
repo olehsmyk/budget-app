@@ -8,6 +8,7 @@ const RATES_MAX_AGE_MS = 24 * 3600 * 1000; // The service only publishes new rat
 const BACKUP_REMINDER_DAYS = 30;
 const SEARCH_LIMIT = 200;
 const TREND_MONTHS = 6;
+const CATEGORY_SHORTLIST = 12;
 const ICON_KEYS = Object.keys(CATEGORY_ICONS);
 
 const today = () => C.toISO(new Date());
@@ -38,11 +39,9 @@ function load() {
   try {
     const saved = JSON.parse(raw);
     const loaded = C.validateBackup(saved);
-    if (saved.version < 2) {
-      // Keep an untouched copy of the old format, then store the upgraded one.
-      localStorage.setItem(`${KEY}.before-wallets`, raw);
-      localStorage.setItem(KEY, JSON.stringify(loaded));
-    }
+    // Keep an untouched copy of the first format, then store the upgraded data.
+    if (saved.version < 2) localStorage.setItem(`${KEY}.before-wallets`, raw);
+    if (saved.version !== loaded.version) localStorage.setItem(KEY, JSON.stringify(loaded));
     return loaded;
   } catch {
     // Never overwrite data we could not read: park it under another key.
@@ -52,7 +51,7 @@ function load() {
 }
 
 let state = load();
-const ui = { tab: 'home', month: C.monthOf(today()), search: '', filterCat: '', filterWallet: '', donutCat: null, sheet: null };
+const ui = { tab: 'home', month: C.monthOf(today()), search: '', filterCat: '', filterWallet: '', donutCat: null, showEmptyWallets: false, sheet: null };
 
 function save() {
   try {
@@ -70,6 +69,12 @@ function runRecurring() {
 
 const category = (id) => state.categories.find((c) => c.id === id);
 const activeCategories = (kind) => state.categories.filter((c) => c.kind === kind && !c.archived);
+function categoriesByUse(kind) {
+  const uses = new Map();
+  for (const t of state.tx) uses.set(t.categoryId, (uses.get(t.categoryId) || 0) + 1);
+  // sort keeps the list order for ties, so a new install shows the everyday categories first.
+  return activeCategories(kind).sort((a, b) => (uses.get(b.id) || 0) - (uses.get(a.id) || 0));
+}
 const wallet = (id) => state.wallets.find((w) => w.id === id);
 const activeWallets = () => state.wallets.filter((w) => !w.archived);
 const otherWallet = (id) => activeWallets().find((w) => w.id !== id)?.id ?? null;
@@ -252,6 +257,9 @@ function banners() {
 function walletsCard() {
   const worth = C.netWorth(state);
   const bal = C.balances(state);
+  const withMoney = activeWallets().filter((w) => bal.get(w.id) !== 0);
+  const shown = ui.showEmptyWallets || !withMoney.length ? activeWallets() : withMoney;
+  const emptyCount = activeWallets().length - withMoney.length;
   return html`<section class="card">
     <div class="row-between">
       <h2 class="section-title">All my money</h2>
@@ -264,7 +272,7 @@ function walletsCard() {
       ${heroAmount(approx(worth.converted) + money(worth.total))}
     </div>
     ${missingRateNote(worth.missing)}
-    <div class="wallet-list">${activeWallets().map((w) => {
+    <div class="wallet-list">${shown.map((w) => {
       const value = C.convert(state, bal.get(w.id), w.currency);
       return html`<button class="tx" data-a="openWallet" data-id="${w.id}">
         ${badge(w)}
@@ -276,6 +284,8 @@ function walletsCard() {
         <span class="tx-amount">${money(bal.get(w.id), w.currency)}</span>
       </button>`;
     })}</div>
+    ${withMoney.length > 0 && emptyCount > 0 && html`<button class="link" data-a="toggleEmptyWallets">
+      ${ui.showEmptyWallets ? 'Hide empty wallets' : `Show ${emptyCount} empty ${emptyCount === 1 ? 'wallet' : 'wallets'}`}</button>`}
     <button class="btn" data-a="newTransfer">Move money</button>
   </section>`;
 }
@@ -607,10 +617,15 @@ function sheetTx(s) {
       </div>`;
   }
 
-  const cats = activeCategories(f.type);
+  const cats = categoriesByUse(f.type);
   const current = category(f.categoryId);
   // An archived category stays selectable when editing an old entry that uses it.
-  const choices = current && current.kind === f.type && current.archived ? [...cats, current] : cats;
+  const all = current && current.kind === f.type && current.archived ? [...cats, current] : cats;
+  // The most used come first, so the usual tap is near the top and the rest are one tap away.
+  const top = all.slice(0, CATEGORY_SHORTLIST);
+  const choices = s.allCategories || all.length <= CATEGORY_SHORTLIST
+    ? all
+    : current && !top.includes(current) && current.kind === f.type ? [...top.slice(0, -1), current] : top;
   return html`${sheetHead(s.id ? 'Edit entry' : 'New entry', 'closeSheet', 'Cancel', 'saveTx')}
     <div class="sheet-body">
       ${seg('txType', f.type, TX_TYPE_OPTIONS)}
@@ -621,6 +636,7 @@ function sheetTx(s) {
         (c) => html`<button type="button" class="cat" data-a="txCat" data-id="${c.id}" aria-pressed="${c.id === f.categoryId}">
           ${badge(c)}${c.name}</button>`,
       )}</div>
+      ${choices.length < all.length && html`<button type="button" class="btn" data-a="showAllCategories">All categories (${all.length})</button>`}
       ${footer}
     </div>`;
 }
@@ -691,6 +707,10 @@ function sheetWallet(s) {
   return html`${sheetHead(s.id ? 'Edit wallet' : 'New wallet', 'openWallets', 'Back', 'saveWallet')}
     <div class="sheet-body">
       ${s.error && html`<p class="error">${s.error}</p>`}
+      ${!s.id && html`<div class="presets">${C.WALLET_PRESETS.map(
+        ([name, icon, color]) => html`<button type="button" class="preset" data-a="pickPreset" data-name="${name}" data-icon="${icon}" data-color="${color}">
+          ${badge({ icon, color }, 'badge-small')}${name}</button>`,
+      )}</div>`}
       <div class="name-row">
         ${badge(f, 'badge-large')}
         <label class="field"><span>Name</span><input id="f-name" class="input" maxlength="40" placeholder="Savings for car" value="${f.name}"></label>
@@ -734,7 +754,15 @@ function sheetRates() {
     </div>`;
 }
 
-const FREQ_LABEL = { weekly: 'Weekly', monthly: 'Monthly', yearly: 'Yearly' };
+const FREQ_LABEL = {
+  weekly: 'Weekly',
+  biweekly: 'Every 2 weeks',
+  fourWeeks: 'Every 4 weeks',
+  monthly: 'Monthly',
+  quarterly: 'Every 3 months',
+  semiannual: 'Every 6 months',
+  yearly: 'Yearly',
+};
 
 function sheetRecurring() {
   return html`${sheetHead('Recurring', 'closeSheet', 'Done')}
@@ -799,9 +827,14 @@ function sheetImport(s) {
   ];
   const result = C.buildImport(s.rows, s.map, s.fmt, state.categories, state.wallets, s.walletId);
   const fits = C.detectDateFormats(s.map.date >= 0 ? s.rows.map((r) => r[s.map.date]) : []);
-  const ready = s.map.date >= 0 && s.map.amount >= 0 && result.tx.length > 0;
+  const ready = s.map.date >= 0 && s.map.amount >= 0 && (result.tx.length > 0 || result.openings.size > 0);
   const allWallets = [...state.wallets, ...result.newWallets];
+  const visibleNewWallets = result.newWallets.filter((w) => !w.archived);
   const allCategories = [...state.categories, ...result.newCategories];
+  const transferNotes = [
+    result.transfersMatched > 0 && `${result.transfersMatched} matched between wallets`,
+    result.transfersToClosed > 0 && `${result.transfersToClosed} with an account that no longer exists, kept in a hidden wallet so balances stay right`,
+  ].filter(Boolean);
   const skips = [
     result.skipped && `${result.skipped} with no valid date or amount`,
     result.mismatched && `${result.mismatched} in a different currency from their wallet`,
@@ -830,9 +863,11 @@ function sheetImport(s) {
       <div class="card">
         <strong>${result.tx.length} entries ready</strong>
         ${skips.length > 0 && html`<p class="small">Skipped: ${skips.join(', ')}.</p>`}
-        ${result.newWallets.length > 0 && html`<p class="small">New wallets: ${result.newWallets.map((w) => `${w.name} (${w.currency})`).join(', ')}</p>`}
+        ${transferNotes.length > 0 && html`<p class="small">Transfers: ${transferNotes.join(', ')}.</p>`}
+        ${result.openings.size > 0 && html`<p class="small">Starting balances set for ${result.openings.size} ${result.openings.size === 1 ? 'wallet' : 'wallets'}.</p>`}
+        ${visibleNewWallets.length > 0 && html`<p class="small">New wallets: ${visibleNewWallets.map((w) => `${w.name} (${w.currency})`).join(', ')}</p>`}
         ${result.newCategories.length > 0 && html`<p class="small">New categories: ${result.newCategories.map((c) => c.name).join(', ')}</p>`}
-        <div class="preview">${result.tx.slice(0, 4).map((t) => {
+        <div class="preview">${result.tx.filter((t) => t.type !== 'transfer').slice(0, 4).map((t) => {
           const name = allCategories.find((c) => c.id === t.categoryId).name;
           const w = allWallets.find((x) => x.id === t.walletId);
           return html`<div><span>${shortDate(t.date)} · ${name}${t.note ? ` · ${t.note}` : ''}</span>
@@ -984,6 +1019,7 @@ function startRestore(text) {
   ui.filterWallet = '';
   render();
   toast(`Restored ${next.tx.length} entries.`, before);
+  refreshRates();
 }
 
 // ---------- Actions ----------
@@ -1069,6 +1105,10 @@ const actions = {
     ui.search = '';
     actions.tab({ tab: 'activity' });
   },
+  toggleEmptyWallets() {
+    ui.showEmptyWallets = !ui.showEmptyWallets;
+    render();
+  },
   openWallet({ id }) {
     ui.filterWallet = id;
     ui.filterCat = '';
@@ -1111,6 +1151,11 @@ const actions = {
     if (f.type !== v) f.categoryId = null;
     f.type = v;
     if (v === 'transfer') fillReceived(f);
+    render();
+  },
+  showAllCategories() {
+    readTxForm();
+    ui.sheet.allCategories = true;
     render();
   },
   txCat({ id }, el) {
@@ -1169,6 +1214,12 @@ const actions = {
     ui.sheet = null;
     render();
     toast('Entry deleted.', before);
+  },
+
+  pickPreset({ name, icon, color }) {
+    readStyleForm();
+    Object.assign(ui.sheet.form, { name, icon, color });
+    render();
   },
 
   // Colors and icons, shared by categories and wallets
@@ -1401,15 +1452,19 @@ const actions = {
   confirmImport() {
     const s = ui.sheet;
     const before = snapshot();
-    const { tx, newCategories, newWallets } = C.buildImport(s.rows, s.map, s.fmt, state.categories, state.wallets, s.walletId);
+    const { tx, newCategories, newWallets, openings } = C.buildImport(s.rows, s.map, s.fmt, state.categories, state.wallets, s.walletId);
     state.categories.push(...newCategories);
     state.wallets.push(...newWallets);
     state.tx.push(...tx);
+    for (const [id, cents] of openings) wallet(id).opening += cents;
+    // Entries most likely belong in the busiest imported wallet from now on.
+    if (newWallets[0] && !newWallets[0].archived) state.lastWalletId = newWallets[0].id;
     save();
     ui.sheet = null;
     ui.tab = 'home';
-    ui.month = C.monthOf(C.sortTx(tx)[0].date);
+    if (tx.length) ui.month = C.monthOf(C.sortTx(tx)[0].date);
     render();
+    scrollTo(0, 0);
     toast(`Imported ${tx.length} entries.`, before);
   },
   undo() {

@@ -48,6 +48,10 @@
 .c-lime { --cat: #a3b81a; --on: #0b0b0b; }
 .c-plum { --cat: #a12d9c; --on: #fff; }
 .c-brown { --cat: #92590f; --on: #fff; }
+.c-navy { --cat: #24568f; --on: #fff; }
+.c-peach { --cat: #f09766; --on: #0b0b0b; }
+.c-teal { --cat: #008f8c; --on: #fff; }
+.c-rose { --cat: #b3364f; --on: #fff; }
 .c-gray { --cat: #77756e; --on: #fff; }
 @media (prefers-color-scheme: dark) {
   .c-blue { --cat: #3987e5; }
@@ -61,6 +65,10 @@
   .c-lime { --cat: #8f9f12; }
   .c-plum { --cat: #b84bb3; }
   .c-brown { --cat: #a56f2d; }
+  .c-navy { --cat: #5f8fd6; }
+  .c-peach { --cat: #c97d4a; --on: #0b0b0b; }
+  .c-teal { --cat: #129a96; }
+  .c-rose { --cat: #c95571; }
   .c-gray { --cat: #8f8d85; }
 }
 
@@ -343,6 +351,18 @@ input[type="date"].input::-webkit-date-and-time-value { text-align: left; }
 .cat .badge svg { width: 18px; height: 18px; }
 .cat[aria-pressed="true"] { border-color: var(--accent); font-weight: 600; }
 
+.presets { display: flex; flex-wrap: wrap; gap: 6px; }
+.preset {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 40px;
+  padding: 4px 12px 4px 6px;
+  border-radius: 20px;
+  background: var(--chip);
+  font-size: 14px;
+  font-weight: 500;
+}
 .name-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: end; gap: 12px; }
 .swatches { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 8px; }
 .swatch {
@@ -501,6 +521,7 @@ details summary { color: var(--accent-ink); font-size: 14px; font-weight: 500; m
 #toast button { font-weight: 700; min-height: 32px; flex: none; }
 
 /* ---------- Import preview ---------- */
-.preview { display: grid; gap: 4px; font-size: 14px; }
+.preview { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; font-size: 14px; }
 .preview div { display: flex; justify-content: space-between; gap: 12px; }
-.preview span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview span:first-child { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview span:last-child { flex: none; white-space: nowrap; }

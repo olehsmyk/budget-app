@@ -284,9 +284,9 @@ test('import infers type from signs and creates only missing categories', () => 
   const rows = [
     ['2026-11-01', '-12.50', 'groceries', 'Shop'],
     ['2026-11-02', '1000', 'Salary', ''],
-    ['2026-11-03', '-3', 'Pets', ''],
-    ['bad date', '-3', 'Pets', ''],
-    ['2026-11-04', 'n/a', 'Pets', ''],
+    ['2026-11-03', '-3', 'Reptiles', ''],
+    ['bad date', '-3', 'Reptiles', ''],
+    ['2026-11-04', 'n/a', 'Reptiles', ''],
   ];
   const out = C.buildImport(rows, map, 'ymd', state.categories, state.wallets, 'w0');
   assert.equal(out.skipped, 2);
@@ -296,7 +296,7 @@ test('import infers type from signs and creates only missing categories', () => 
     ['expense', 300, 'w0'],
   ]);
   assert.equal(out.tx[0].categoryId, 'c0', 'category match ignores case');
-  assert.deepEqual(out.newCategories.map((c) => c.name), ['Pets']);
+  assert.deepEqual(out.newCategories.map((c) => c.name), ['Reptiles']);
 });
 
 test('positive-only file with a type column uses the column', () => {
@@ -354,7 +354,7 @@ test('data saved by the first version upgrades with nothing lost', () => {
   const out = C.validateBackup(JSON.parse(original));
 
   assert.equal(JSON.stringify(v1), original, 'the input is not modified');
-  assert.equal(out.version, 2);
+  assert.equal(out.version, 3);
   assert.equal(out.currency, 'UAH');
   assert.deepEqual(out.wallets.map((w) => [w.name, w.currency, w.opening]), [['Main', 'UAH', 0]]);
   assert.deepEqual(out.tx.map((t) => [t.id, t.amount, t.note, t.walletId]), [
@@ -366,7 +366,7 @@ test('data saved by the first version upgrades with nothing lost', () => {
   assert.equal(out.categories[0].limit, 500000);
   assert.equal(C.summarize(out, out.tx).expense, 12550);
   assert.equal(C.balances(out).get('w0'), 4500000 - 12550);
-  assert.deepEqual(out.categories.map((c) => [c.icon, c.color]), [
+  assert.deepEqual(out.categories.slice(0, 2).map((c) => [c.icon, c.color]), [
     ['shopping-cart', 'green'],
     ['briefcase', 'green'],
   ]);
@@ -380,15 +380,15 @@ test('a custom first-version category with an unknown emoji gets a generic icon 
     { id: 'b', name: 'Bikes', icon: '🚲', kind: 'expense', limit: null, archived: false },
   ];
   const out = C.validateBackup(v1);
-  assert.deepEqual(out.categories.map((c) => c.icon), ['tag', 'tag']);
+  assert.deepEqual(out.categories.slice(0, 2).map((c) => c.icon), ['tag', 'tag']);
   assert.notEqual(out.categories[0].color, out.categories[1].color);
 });
 
-test('every default category has a color from the palette, and expense colors are all different', () => {
+test('every default category has a color from the palette, and they use the whole palette', () => {
   const { categories } = C.defaultState('2026-01-01');
   for (const c of categories) assert.ok(C.COLOR_KEYS.includes(c.color), c.name);
   const expense = categories.filter((c) => c.kind === 'expense').map((c) => c.color);
-  assert.equal(new Set(expense).size, expense.length);
+  assert.equal(new Set(expense).size, C.COLOR_KEYS.length);
 });
 
 test('nextColor picks the least used color and avoids gray', () => {
@@ -402,7 +402,7 @@ test('imported new categories and wallets get different colors', () => {
   const state = C.defaultState('2026-01-01');
   const map = { date: 0, amount: 1, category: 2, wallet: 3, note: -1, type: -1 };
   const out = C.buildImport(
-    [['2026-11-01', '-1', 'Pets', 'A'], ['2026-11-02', '-2', 'Toys', 'B']],
+    [['2026-11-01', '-1', 'Reptiles', 'A'], ['2026-11-02', '-2', 'Toys', 'B']],
     map,
     'ymd',
     state.categories,
@@ -413,4 +413,164 @@ test('imported new categories and wallets get different colors', () => {
   assert.notEqual(out.newWallets[0].color, out.newWallets[1].color);
   assert.equal(out.newCategories[0].icon, 'tag');
   assert.equal(out.newWallets[0].icon, 'wallet');
+});
+
+test('version 2 data gains the new default categories without touching what is there', () => {
+  const v2 = C.defaultState('2026-01-01');
+  v2.version = 2;
+  v2.categories = v2.categories.slice(0, 13);
+  v2.categories[0].name = 'Food shop'; // renamed by the user
+  v2.categories[0].limit = 1234;
+  v2.categories.push({ id: 'mine', name: 'taxi', icon: 'car', color: 'red', kind: 'expense', limit: null, archived: true });
+  v2.tx.push({ id: '1', date: '2026-11-01', type: 'expense', amount: 100, walletId: 'w0', categoryId: 'c0', note: '' });
+
+  const out = C.validateBackup(JSON.parse(JSON.stringify(v2)));
+  assert.equal(out.version, 3);
+  assert.equal(out.categories[0].name, 'Food shop');
+  assert.equal(out.categories[0].limit, 1234);
+  assert.equal(out.categories.filter((c) => c.name.toLowerCase() === 'taxi').length, 1, 'no duplicate, even of a hidden one');
+  assert.ok(out.categories.some((c) => c.name === 'Donations'));
+  assert.ok(out.categories.some((c) => c.name === 'Gifts' && c.kind === 'income'));
+  assert.equal(new Set(out.categories.map((c) => c.id)).size, out.categories.length);
+  assert.equal(C.validateBackup(JSON.parse(JSON.stringify(out))).categories.length, out.categories.length, 'running it twice adds nothing');
+});
+
+test('new repeat intervals land on the right dates', () => {
+  assert.deepEqual([0, 1, 2].map((n) => C.occurrence('2026-01-01', 'fourWeeks', n)), ['2026-01-01', '2026-01-29', '2026-02-26']);
+  assert.equal(C.occurrence('2026-01-01', 'biweekly', 2), '2026-01-29');
+  assert.equal(C.occurrence('2026-01-31', 'quarterly', 1), '2026-04-30');
+  assert.equal(C.occurrence('2026-08-31', 'semiannual', 1), '2027-02-28');
+});
+
+test('a column of amounts decides what a dot means', () => {
+  assert.equal(C.detectDecimalMark(['-4000', '-1.6', '96.025']), '.');
+  assert.equal(C.detectDecimalMark(['12,5', '1.234,56']), ',');
+  assert.equal(C.detectDecimalMark(['1,234.50']), '.');
+  assert.equal(C.detectDecimalMark(['100', '200']), null);
+  assert.equal(C.detectDecimalMark(['96.025']), null, 'alone, it could be either');
+
+  assert.equal(C.parseAmount('96.025', '.'), 9603);
+  assert.equal(C.parseAmount('96.025'), 9602500, 'with no context, three digits read as thousands');
+  assert.equal(C.parseAmount('1.234,56', ','), 123456);
+  assert.equal(C.parseAmount('-4000', '.'), -400000);
+});
+
+// Made-up rows in the same layout as a Monefy export.
+const MONEFY_HEADER = ['date', 'account', 'category', 'amount', 'currency', 'converted amount', 'currency', 'description'];
+function importMonefy(rows, state = C.defaultState('2026-01-01')) {
+  const map = C.guessMapping(MONEFY_HEADER);
+  const out = C.buildImport(rows, map, 'dmy', state.categories, state.wallets, 'w0');
+  return { map, out, state };
+}
+
+test('Monefy columns are recognised, including the repeated currency header', () => {
+  const map = C.guessMapping(MONEFY_HEADER);
+  assert.deepEqual(
+    [map.date, map.wallet, map.category, map.amount, map.currency, map.converted, map.note],
+    [0, 1, 2, 3, 4, 5, 7],
+  );
+});
+
+test('Monefy transfer rows become one real transfer each and never count as spending', () => {
+  const { out, state } = importMonefy([
+    ['01.03.2026', 'Готівка', 'ExpenseTransfer', '-4500', 'UAH', '-4500', 'UAH', 'to euro'],
+    ['01.03.2026', 'Euro', 'IncomeTransfer', '100', 'EUR', '4510', 'UAH', 'to euro'],
+    ['02.03.2026', 'Готівка', 'Донати', '-500', 'UAH', '-500', 'UAH', ''],
+  ]);
+  assert.equal(out.transfersMatched, 1);
+  const t = out.tx.find((x) => x.type === 'transfer');
+  const cash = out.newWallets.find((w) => w.name === 'Cash');
+  const euro = out.newWallets.find((w) => w.name === 'Euro');
+  assert.deepEqual([t.walletId, t.amount, t.toWalletId, t.toAmount, t.note], [cash.id, 450000, euro.id, 10000, 'to euro']);
+
+  const merged = { ...state, wallets: [...state.wallets, ...out.newWallets], categories: [...state.categories, ...out.newCategories], tx: out.tx, currency: 'UAH', rates: {} };
+  assert.equal(C.summarize(merged, merged.tx.filter((x) => x.walletId === cash.id)).expense, 50000);
+});
+
+test('when two transfers share a day, rows pair by value rather than by order', () => {
+  // Reading top to bottom would wrongly pair the USD row with the first arrival.
+  const { out } = importMonefy([
+    ['15.08.2026', 'Доларова', 'ExpenseTransfer', '-200', 'USD', '-9100', 'UAH', ''],
+    ['15.08.2026', 'Єврова', 'ExpenseTransfer', '-100', 'EUR', '-5100', 'UAH', ''],
+    ['15.08.2026', 'Платіжна картка', 'IncomeTransfer', '5100', 'UAH', '5100', 'UAH', ''],
+    ['15.08.2026', 'Єврова', 'IncomeTransfer', '178.43', 'EUR', '9100', 'UAH', ''],
+  ]);
+  assert.equal(out.transfersMatched, 2);
+  assert.equal(out.transfersToClosed, 0);
+  const names = new Map(out.newWallets.map((w) => [w.id, w.name]));
+  const seen = out.tx.map((t) => `${names.get(t.walletId)}>${names.get(t.toWalletId)}:${t.toAmount}`).sort();
+  assert.deepEqual(seen, ['EUR card>Card:510000', 'USD card>EUR card:17843']);
+});
+
+test('money moved through a wallet in one day stays two transfers, not one', () => {
+  const { out } = importMonefy([
+    ['15.08.2026', 'Готівка', 'ExpenseTransfer', '-5000', 'UAH', '-5000', 'UAH', ''],
+    ['15.08.2026', 'Єврова', 'IncomeTransfer', '100', 'EUR', '5100', 'UAH', ''],
+    ['15.08.2026', 'Єврова', 'ExpenseTransfer', '-100', 'EUR', '-5100', 'UAH', ''],
+    ['15.08.2026', 'Revolut', 'IncomeTransfer', '96.025', 'EUR', '4990', 'UAH', ''],
+  ]);
+  assert.equal(out.transfersMatched, 2);
+  assert.equal(out.transfersToClosed, 0);
+  const names = new Map(out.newWallets.map((w) => [w.id, w.name]));
+  const seen = out.tx.map((t) => `${names.get(t.walletId)}>${names.get(t.toWalletId)}`).sort();
+  assert.deepEqual(seen, ['Cash>EUR card', 'EUR card>Revolut']);
+});
+
+test('a transfer whose other account no longer exists keeps the balance using a hidden wallet', () => {
+  const { out } = importMonefy([
+    ['05.05.2026', 'Готівка', 'ExpenseTransfer', '-1000', 'UAH', '-1000', 'UAH', ''],
+    ['06.05.2026', 'Доларова', 'IncomeTransfer', '500', 'USD', '22000', 'UAH', ''],
+  ]);
+  assert.equal(out.transfersMatched, 0);
+  assert.equal(out.transfersToClosed, 2);
+  const hidden = out.newWallets.filter((w) => w.archived);
+  assert.deepEqual(hidden.map((w) => [w.name, w.currency]).sort(), [['Closed wallets (UAH)', 'UAH'], ['Closed wallets (USD)', 'USD']]);
+  const state = { wallets: out.newWallets, tx: out.tx };
+  const b = C.balances(state);
+  assert.equal(b.get(out.newWallets.find((w) => w.name === 'Cash').id), -100000);
+  assert.equal(b.get(out.newWallets.find((w) => w.name === 'USD card').id), 50000);
+});
+
+test('Monefy opening balances set the wallet balance instead of counting as income', () => {
+  const { out } = importMonefy([
+    ['26.10.2022', 'Euro', 'InitialBalance', '50', 'EUR', '2000', 'UAH', ''],
+    ['27.10.2022', 'Euro', 'Food', '-1.6', 'EUR', '-65', 'UAH', ''],
+  ]);
+  const euro = out.newWallets[0];
+  assert.equal(out.openings.get(euro.id), 5000);
+  assert.equal(out.tx.length, 1);
+  assert.equal(out.tx[0].amount, 160, 'the dot is read as a decimal from the whole column');
+});
+
+test('Ukrainian and Monefy names become English and join the matching defaults', () => {
+  const state = C.defaultState('2026-01-01');
+  const { out } = importMonefy([
+    ['01.01.2026', 'Готівка', 'Донати', '-1', 'UAH', '-1', 'UAH', ''],
+    ['01.01.2026', 'Депозит 2', "Зв'язок", '-1', 'UAH', '-1', 'UAH', ''],
+    ['01.01.2026', 'Готівка', 'Зв’язок', '-1', 'UAH', '-1', 'UAH', ''],
+    ['01.01.2026', 'Готівка', 'Food', '-1', 'UAH', '-1', 'UAH', ''],
+    ['01.01.2026', 'Готівка', 'Подарунки', '5', 'UAH', '5', 'UAH', ''],
+    ['01.01.2026', 'Готівка', 'Partner', '-1', 'UAH', '-1', 'UAH', ''],
+    ['01.01.2026', 'Готівка', 'Щось нове', '-1', 'UAH', '-1', 'UAH', ''],
+  ], state);
+  const name = (id) => [...state.categories, ...out.newCategories].find((c) => c.id === id);
+  assert.deepEqual(out.tx.map((t) => name(t.categoryId).name), ['Donations', 'Phone & internet', 'Phone & internet', 'Groceries', 'Gifts', 'Partner', 'Щось нове']);
+  assert.equal(name(out.tx[4].categoryId).kind, 'income', 'a name used for both kinds stays separate');
+  assert.deepEqual(out.newCategories.map((c) => [c.name, c.icon]), [['Partner', 'heart'], ['Щось нове', 'tag']]);
+  assert.deepEqual(out.newWallets.map((w) => [w.name, w.icon]), [['Cash', 'banknote'], ['Deposit 2', 'landmark']]);
+});
+
+test('imported wallets list the busiest first and hidden ones last', () => {
+  const { out } = importMonefy([
+    ['01.01.2026', 'Quiet', 'Food', '-1', 'USD', '-1', 'UAH', ''],
+    ['01.01.2026', 'Quiet', 'ExpenseTransfer', '-1', 'USD', '-40', 'UAH', 'gone'],
+    ['01.01.2026', 'Busy', 'Food', '-1', 'USD', '-1', 'UAH', ''],
+    ['02.01.2026', 'Busy', 'Food', '-1', 'USD', '-1', 'UAH', ''],
+    ['03.01.2026', 'Busy', 'Food', '-1', 'USD', '-1', 'UAH', ''],
+  ]);
+  assert.deepEqual(out.newWallets.map((w) => w.name), ['Busy', 'Quiet', 'Closed wallets (USD)']);
+});
+
+test('wallet presets use real icons and colors', () => {
+  for (const [name, , color] of C.WALLET_PRESETS) assert.ok(C.COLOR_KEYS.includes(color), name);
 });

@@ -21,7 +21,8 @@ export const addMonths = (key, n) => {
 
 // Colors are stored by name so each can have its own light and dark shade (see styles.css).
 export const COLOR_KEYS = [
-  'blue', 'orange', 'aqua', 'yellow', 'magenta', 'green', 'violet', 'red', 'sky', 'lime', 'plum', 'brown', 'gray',
+  'blue', 'orange', 'aqua', 'yellow', 'magenta', 'green', 'violet', 'red', 'sky', 'lime', 'plum', 'brown',
+  'navy', 'peach', 'teal', 'rose', 'gray',
 ];
 
 // The color used least so far, so new items look different from existing ones.
@@ -45,12 +46,57 @@ const DEFAULT_CATEGORIES = [
   ['Salary', 'briefcase', 'green', 'income', '💼'],
   ['Freelance', 'receipt', 'blue', 'income', '🧾'],
   ['Other income', 'coins', 'yellow', 'income', '💰'],
+  // Added in version 3. Appended so the ids of the categories above never change.
+  ['Taxi', 'car-taxi-front', 'yellow', 'expense'],
+  ['Phone & internet', 'smartphone', 'teal', 'expense'],
+  ['Clothes', 'shirt', 'lime', 'expense'],
+  ['Personal care', 'spray-can', 'peach', 'expense'],
+  ['Electronics', 'laptop', 'navy', 'expense'],
+  ['Games', 'gamepad-2', 'lime', 'expense'],
+  ['Books', 'book-open', 'brown', 'expense'],
+  ['Sports', 'dumbbell', 'aqua', 'expense'],
+  ['Education', 'graduation-cap', 'navy', 'expense'],
+  ['Travel', 'plane', 'aqua', 'expense'],
+  ['Gifts', 'gift', 'red', 'expense'],
+  ['Donations', 'hand-heart', 'rose', 'expense'],
+  ['Pets', 'paw-print', 'brown', 'expense'],
+  ['Car', 'car', 'blue', 'expense'],
+  ['Taxes', 'badge-percent', 'gray', 'expense'],
+  ['Business', 'briefcase', 'violet', 'expense'],
+  ['Loans', 'hand-coins', 'orange', 'expense'],
+  ['Business', 'store', 'violet', 'income'],
+  ['Deposits', 'landmark', 'aqua', 'income'],
+  ['Savings', 'piggy-bank', 'magenta', 'income'],
+  ['Gifts', 'gift', 'red', 'income'],
+  ['Loans', 'hand-coins', 'orange', 'income'],
+];
+
+const defaultCategory = ([name, icon, color, kind], i) => ({
+  id: `c${i}`,
+  name,
+  icon,
+  color,
+  kind,
+  limit: null,
+  archived: false,
+});
+
+// Ready-made starting points on the new wallet form.
+export const WALLET_PRESETS = [
+  ['Cash', 'banknote', 'green'],
+  ['Card', 'credit-card', 'blue'],
+  ['Savings', 'piggy-bank', 'magenta'],
+  ['Deposit', 'landmark', 'teal'],
+  ['Bonds', 'file-text', 'lime'],
+  ['Investments', 'trending-up', 'violet'],
+  ['Business', 'briefcase', 'navy'],
+  ['Lent out', 'hand-coins', 'orange'],
 ];
 
 export function defaultState(nowISO) {
   return {
     app: 'budget',
-    version: 2,
+    version: 3,
     // The currency totals, charts and budget limits are shown in.
     currency: 'USD',
     // How much 1 unit of each other currency is worth in `currency`.
@@ -61,15 +107,7 @@ export function defaultState(nowISO) {
     lastBackup: null,
     lastWalletId: 'w0',
     wallets: [{ id: 'w0', name: 'Main', icon: 'wallet', color: 'blue', currency: 'USD', opening: 0, archived: false }],
-    categories: DEFAULT_CATEGORIES.map(([name, icon, color, kind], i) => ({
-      id: `c${i}`,
-      name,
-      icon,
-      color,
-      kind,
-      limit: null,
-      archived: false,
-    })),
+    categories: DEFAULT_CATEGORIES.map(defaultCategory),
     tx: [],
     recurring: [],
   };
@@ -102,6 +140,17 @@ function migrateV1(o) {
   };
 }
 
+// Version 3 added more default categories. A category with the same name is left alone, including
+// a hidden one, so nothing the user renamed or hid comes back.
+function migrateV2(o) {
+  const taken = new Set(o.categories.map((c) => `${c.kind}:${c.name.toLowerCase()}`));
+  const ids = new Set(o.categories.map((c) => c.id));
+  const added = DEFAULT_CATEGORIES.map(defaultCategory).filter(
+    (c) => !taken.has(`${c.kind}:${c.name.toLowerCase()}`) && !ids.has(c.id),
+  );
+  return { ...o, version: 3, categories: [...o.categories, ...added] };
+}
+
 // Throws if the object is not a usable backup, so a bad file can never replace good data.
 // Returns the data in the current format.
 export function validateBackup(input) {
@@ -118,7 +167,8 @@ export function validateBackup(input) {
     fail('missing data lists');
   }
   if (!isCurrency(input.currency)) fail('bad currency');
-  const o = input.version >= 2 ? input : migrateV1(input);
+  const o2 = input.version >= 2 ? input : migrateV1(input);
+  const o = o2.version >= 3 ? o2 : migrateV2(o2);
 
   if (!Array.isArray(o.wallets) || !o.wallets.length) fail('no wallets');
   if (!o.rates || typeof o.rates !== 'object') fail('bad exchange rates');
@@ -155,7 +205,7 @@ export function validateBackup(input) {
       !isType(r.type) ||
       !ids.has(r.categoryId) ||
       !walletIds.has(r.walletId) ||
-      !['weekly', 'monthly', 'yearly'].includes(r.freq)
+      !(r.freq in FREQ_DAYS || r.freq in FREQ_MONTHS)
     ) {
       fail('bad recurring item');
     }
@@ -214,9 +264,29 @@ export function changeDisplayCurrency(state, next, rate) {
 
 // ---------- Money ----------
 
+// Finds which mark a whole column uses for decimals, because one value alone can't say:
+// "96.025" is 96 in a file where others read "1.6", but 96 thousand in one using "1.234,56".
+export function detectDecimalMark(values) {
+  const clearlyDecimal = (s, mark) => {
+    const parts = s.split(mark);
+    return parts.length === 2 && parts[1].length !== 3 && parts[1].length > 0;
+  };
+  let dot = false;
+  let comma = false;
+  for (const value of values) {
+    const s = String(value ?? '').replace(/[^\d.,]/g, '');
+    if (s.includes('.') && s.includes(',')) return s.lastIndexOf('.') > s.lastIndexOf(',') ? '.' : ',';
+    dot = dot || clearlyDecimal(s, '.');
+    comma = comma || clearlyDecimal(s, ',');
+  }
+  if (dot === comma) return null;
+  return dot ? '.' : ',';
+}
+
 // Accepts "12", "12.5", "12,50", "1,234.56", "1.234,56", "1 234,56", "$12", "-5", "(5.00)".
+// `decimalMark` comes from detectDecimalMark when reading a file; without it the mark is inferred.
 // Returns signed cents, or null when there is no number.
-export function parseAmount(input) {
+export function parseAmount(input, decimalMark = null) {
   const raw = String(input ?? '').trim();
   if (!/\d/.test(raw)) return null;
   const negative = /^\(.*\)$/.test(raw) || /^[^\d]*[-−]/.test(raw) || /[-−]\s*$/.test(raw);
@@ -225,7 +295,9 @@ export function parseAmount(input) {
   const lastDot = s.lastIndexOf('.');
   const lastComma = s.lastIndexOf(',');
   let sep = -1;
-  if (lastDot >= 0 && lastComma >= 0) {
+  if (decimalMark) {
+    sep = s.lastIndexOf(decimalMark);
+  } else if (lastDot >= 0 && lastComma >= 0) {
     sep = Math.max(lastDot, lastComma);
   } else if (lastDot >= 0 || lastComma >= 0) {
     const idx = Math.max(lastDot, lastComma);
@@ -249,14 +321,17 @@ export const centsToInput = (cents) => (cents / 100).toFixed(2);
 
 // ---------- Recurring ----------
 
+const FREQ_DAYS = { weekly: 7, biweekly: 14, fourWeeks: 28 };
+const FREQ_MONTHS = { monthly: 1, quarterly: 3, semiannual: 6, yearly: 12 };
+
 // The nth occurrence is always computed from the start date, so "monthly on the 31st"
 // gives Jan 31, Feb 28, Mar 31 rather than drifting to the 28th forever.
 export function occurrence(start, freq, n) {
   const s = fromISO(start);
-  if (freq === 'weekly') {
-    return toISO(new Date(s.getFullYear(), s.getMonth(), s.getDate() + 7 * n));
+  if (freq in FREQ_DAYS) {
+    return toISO(new Date(s.getFullYear(), s.getMonth(), s.getDate() + FREQ_DAYS[freq] * n));
   }
-  const months = (freq === 'yearly' ? 12 : 1) * n;
+  const months = FREQ_MONTHS[freq] * n;
   const d = new Date(s.getFullYear(), s.getMonth() + months, 1);
   const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
   d.setDate(Math.min(s.getDate(), lastDay));
@@ -449,6 +524,7 @@ export function parseCSV(input) {
 
 export const IMPORT_FIELDS = {
   date: /date|day|time|дата/i,
+  converted: /convert/i,
   amount: /amount|sum|value|price|total|сума/i,
   category: /categ|катег/i,
   type: /^type$|kind|transaction.?type|income.?expense|тип/i,
@@ -493,6 +569,145 @@ const INCOME_WORDS = /inc|credit|earn|revenue|salary|deposit|дох/i;
 const EXPENSE_WORDS = /exp|debit|spend|cost|payment|витр/i;
 const TRANSFER_WORDS = /transfer|переказ/i;
 
+// Names from other apps, mapped onto this app's English categories. Keys are lower case.
+const CATEGORY_NAMES = new Map(Object.entries({
+  // Monefy's English defaults
+  food: 'Groceries',
+  house: 'Housing',
+  bills: 'Utilities',
+  communications: 'Phone & internet',
+  toiletry: 'Personal care',
+  misc: 'Other',
+  // Ukrainian
+  'їжа': 'Groceries',
+  'продукти': 'Groceries',
+  'кафе': 'Eating out',
+  'ресторани': 'Eating out',
+  'транспорт': 'Transport',
+  'таксі': 'Taxi',
+  'житло': 'Housing',
+  'дім': 'Housing',
+  'рахунки': 'Utilities',
+  "зв'язок": 'Phone & internet',
+  'підписки': 'Subscriptions',
+  "здоров'я": 'Health',
+  'гігієна': 'Personal care',
+  'одяг': 'Clothes',
+  'покупки': 'Shopping',
+  'електроніка': 'Electronics',
+  'розваги': 'Entertainment',
+  'ігри': 'Games',
+  'книги': 'Books',
+  'спорт': 'Sports',
+  'навчання': 'Education',
+  'освіта': 'Education',
+  'подорожі': 'Travel',
+  'подарунки': 'Gifts',
+  'донати': 'Donations',
+  'улюбленці': 'Pets',
+  'тварини': 'Pets',
+  'машина': 'Car',
+  'авто': 'Car',
+  'податки': 'Taxes',
+  'бізнес': 'Business',
+  'позика': 'Loans',
+  'різне': 'Other',
+  'інше': 'Other',
+  'зарплата': 'Salary',
+  'заощадження': 'Savings',
+  'депозити': 'Deposits',
+}));
+
+const WALLET_NAMES = new Map(Object.entries({
+  'готівка': 'Cash',
+  'платіжна картка': 'Card',
+  'картка': 'Card',
+  'доларова': 'USD card',
+  'єврова': 'EUR card',
+  'позичив': 'Lent out',
+  'позичив дол': 'Lent out USD',
+  'облігації': 'Bonds',
+  'депозит': 'Deposit',
+  'заощадження': 'Savings',
+  'мама': 'Mom',
+  'фоп': 'FOP',
+  'фоп $': 'FOP $',
+}));
+
+// Translates a name, keeping a trailing number: "Депозит 2" becomes "Deposit 2".
+function translated(name, table) {
+  const [, base, suffix = ''] = name.trim().replace(/[’ʼ]/g, "'").match(/^(.*?)(\s+\d+)?$/);
+  const english = table.get(base.toLowerCase());
+  return english ? english + suffix : name.trim();
+}
+
+const CATEGORY_ICON_HINTS = [
+  [/girlfriend|boyfriend|partner|wife|husband|love|date/i, 'heart'],
+  [/special|bonus/i, 'star'],
+  [/furniture/i, 'sofa'],
+  [/photo|camera/i, 'camera'],
+  [/art|hobby/i, 'palette'],
+  [/music|concert/i, 'music'],
+  [/coffee/i, 'coffee'],
+  [/bar|beer|alcohol/i, 'beer'],
+];
+const WALLET_ICON_HINTS = [
+  [/cash/i, 'banknote'],
+  [/card/i, 'credit-card'],
+  [/saving/i, 'piggy-bank'],
+  [/deposit/i, 'landmark'],
+  [/bond/i, 'file-text'],
+  [/invest|stock|crypto/i, 'trending-up'],
+  [/lent|loan|debt/i, 'hand-coins'],
+  [/mom|dad|family|friend/i, 'users'],
+  [/fop|business|company|work/i, 'briefcase'],
+  [/travel|trip/i, 'plane'],
+];
+const iconFromHints = (name, hints, fallback) => hints.find(([re]) => re.test(name))?.[1] ?? fallback;
+
+// Monefy writes each transfer as two rows and doesn't say which rows belong together. Within a day,
+// the closest pair by note and converted value is taken first, so the rows can't pair up wrongly.
+function pairTransfers(outs, ins) {
+  // Different notes or values more than 5% apart mean these are two separate transfers.
+  const compatible = (a, b) => {
+    if (a.date !== b.date || a.wallet === b.wallet || a.note !== b.note) return false;
+    if (!a.converted || !b.converted) return true;
+    return Math.abs(a.converted - b.converted) / Math.max(a.converted, b.converted) <= 0.05;
+  };
+  const gap = (a, b) => (a.converted && b.converted ? Math.abs(a.converted - b.converted) : 0);
+
+  const candidates = [];
+  for (const a of outs) {
+    for (const b of ins) {
+      if (compatible(a, b)) candidates.push({ a, b, gap: gap(a, b) });
+    }
+  }
+  candidates.sort((x, y) => x.gap - y.gap);
+  const pairs = [];
+  const used = new Set();
+  for (const { a, b } of candidates) {
+    if (used.has(a) || used.has(b)) continue;
+    used.add(a);
+    used.add(b);
+    pairs.push([a, b]);
+  }
+
+  // Money moved A -> B -> C in one day can pair as A -> C, leaving B's two rows with nothing to match.
+  // Splitting that pair uses every row, which is what actually happened.
+  for (const a of outs.filter((r) => !used.has(r))) {
+    for (const b of ins.filter((r) => !used.has(r))) {
+      if (used.has(a) || used.has(b)) continue;
+      const i = pairs.findIndex(([x, y]) => compatible(x, b) && compatible(a, y));
+      if (i < 0) continue;
+      const [x, y] = pairs[i];
+      pairs.splice(i, 1, [x, b], [a, y]);
+      used.add(a);
+      used.add(b);
+    }
+  }
+  return { pairs, unpairedOut: outs.filter((r) => !used.has(r)), unpairedIn: ins.filter((r) => !used.has(r)) };
+}
+
 // Rows go to the wallet named in the file, or to `defaultWalletId` when the file names none.
 // A row whose currency differs from its wallet is skipped: its amount would be silently wrong.
 export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId) {
@@ -502,29 +717,47 @@ export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId
   const newCategories = [];
   const newWallets = [];
   const tx = [];
+  const openings = new Map();
+  const transferOuts = [];
+  const transferIns = [];
   let skipped = 0;
   let transfers = 0;
   let mismatched = 0;
   const cell = (row, field) => (map[field] >= 0 ? String(row[map[field]] ?? '').trim() : '');
-  const hasNegatives = rows.some((r) => parseAmount(cell(r, 'amount')) < 0);
+  const decimalMark = detectDecimalMark(rows.map((r) => cell(r, 'amount')));
+  const convertedMark = detectDecimalMark(rows.map((r) => cell(r, 'converted')));
+  const hasNegatives = rows.some((r) => parseAmount(cell(r, 'amount'), decimalMark) < 0);
+
+  const hiddenWallet = (currency) => {
+    const name = `Closed wallets (${currency})`;
+    let wallet = walletByName.get(name.toLowerCase());
+    if (!wallet) {
+      wallet = { id: uid(), name, icon: 'archive', color: 'gray', currency, opening: 0, archived: true };
+      walletByName.set(name.toLowerCase(), wallet);
+      newWallets.push(wallet);
+    }
+    return wallet;
+  };
 
   for (const row of rows) {
     const date = parseDate(cell(row, 'date'), fmt);
-    const amount = parseAmount(cell(row, 'amount'));
+    const amount = parseAmount(cell(row, 'amount'), decimalMark);
     if (!date || !amount) {
       skipped++;
       continue;
     }
+    const categoryCell = unguardFormula(cell(row, 'category'));
     const typeCell = cell(row, 'type');
-    // A transfer needs both sides to be correct, so it is reported rather than guessed at.
-    if (TRANSFER_WORDS.test(typeCell)) {
+    const isPairedTransfer = /^(expense|income)transfer$/i.test(categoryCell);
+    // A transfer row with no way to find its other half is reported rather than guessed at.
+    if (!isPairedTransfer && TRANSFER_WORDS.test(typeCell)) {
       transfers++;
       continue;
     }
 
     const currencyCell = cell(row, 'currency').toUpperCase();
     const rowCurrency = /^[A-Z]{3}$/.test(currencyCell) ? currencyCell : null;
-    const walletName = unguardFormula(cell(row, 'wallet'));
+    const walletName = translated(unguardFormula(cell(row, 'wallet')), WALLET_NAMES);
     let wallet = walletName ? walletByName.get(walletName.toLowerCase()) : defaultWallet;
     if (rowCurrency && wallet && wallet.currency !== rowCurrency) {
       mismatched++;
@@ -534,7 +767,7 @@ export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId
       wallet = {
         id: uid(),
         name: walletName,
-        icon: 'wallet',
+        icon: iconFromHints(walletName, WALLET_ICON_HINTS, 'wallet'),
         color: nextColor([...wallets, ...newWallets]),
         currency: rowCurrency || defaultWallet.currency,
         opening: 0,
@@ -544,6 +777,24 @@ export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId
       newWallets.push(wallet);
     }
 
+    if (/^initialbalance$/i.test(categoryCell)) {
+      openings.set(wallet.id, (openings.get(wallet.id) || 0) + amount);
+      continue;
+    }
+
+    if (isPairedTransfer) {
+      const converted = parseAmount(cell(row, 'converted'), convertedMark);
+      const record = {
+        date,
+        wallet,
+        amount: Math.abs(amount),
+        converted: converted === null ? null : Math.abs(converted),
+        note: unguardFormula(cell(row, 'note')),
+      };
+      (/^expense/i.test(categoryCell) ? transferOuts : transferIns).push(record);
+      continue;
+    }
+
     let type;
     if (INCOME_WORDS.test(typeCell)) type = 'income';
     else if (EXPENSE_WORDS.test(typeCell)) type = 'expense';
@@ -551,13 +802,14 @@ export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId
     else type = 'expense';
 
     const name =
-      unguardFormula(cell(row, 'category')) || (type === 'income' ? 'Other income' : 'Other');
+      translated(categoryCell, CATEGORY_NAMES) || (type === 'income' ? 'Other income' : 'Other');
     const key = `${type}:${name.toLowerCase()}`;
     if (!known.has(key)) {
       const id = uid();
       known.set(key, id);
       const color = nextColor([...categories, ...newCategories]);
-      newCategories.push({ id, name, icon: 'tag', color, kind: type, limit: null, archived: false });
+      const icon = iconFromHints(name, CATEGORY_ICON_HINTS, 'tag');
+      newCategories.push({ id, name, icon, color, kind: type, limit: null, archived: false });
     }
     tx.push({
       id: uid(),
@@ -569,5 +821,31 @@ export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId
       note: unguardFormula(cell(row, 'note')),
     });
   }
-  return { tx, newCategories, newWallets, skipped, transfers, mismatched };
+
+  const { pairs, unpairedOut, unpairedIn } = pairTransfers(transferOuts, transferIns);
+  const transfer = (date, from, amount, to, toAmount, note) =>
+    tx.push({ id: uid(), date, type: 'transfer', amount, walletId: from.id, toWalletId: to.id, toAmount, note });
+  for (const [a, b] of pairs) transfer(a.date, a.wallet, a.amount, b.wallet, b.amount, a.note);
+  // The other side was an account since deleted in the old app. A hidden wallet keeps this balance right.
+  for (const r of unpairedOut) transfer(r.date, r.wallet, r.amount, hiddenWallet(r.wallet.currency), r.amount, r.note);
+  for (const r of unpairedIn) transfer(r.date, hiddenWallet(r.wallet.currency), r.amount, r.wallet, r.amount, r.note);
+
+  // The file's first row says nothing about which wallet matters, so the busiest come first.
+  const uses = new Map();
+  for (const t of tx) {
+    for (const id of [t.walletId, t.toWalletId]) uses.set(id, (uses.get(id) || 0) + 1);
+  }
+  newWallets.sort((a, b) => a.archived - b.archived || (uses.get(b.id) || 0) - (uses.get(a.id) || 0));
+
+  return {
+    tx,
+    newCategories,
+    newWallets,
+    openings,
+    skipped,
+    transfers,
+    mismatched,
+    transfersMatched: pairs.length,
+    transfersToClosed: unpairedOut.length + unpairedIn.length,
+  };
 }
