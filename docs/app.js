@@ -5,10 +5,12 @@ const KEY = 'budget.v1';
 const COMMON_CURRENCIES = ['USD', 'EUR', 'UAH', 'IDR', 'GBP', 'PLN', 'CZK', 'CHF', 'SEK', 'NOK', 'DKK', 'CAD', 'AUD', 'JPY'];
 const RATES_URL = 'https://open.er-api.com/v6/latest/USD';
 const RATES_MAX_AGE_MS = 24 * 3600 * 1000; // The service only publishes new rates once a day.
+const RATES_TIMEOUT_MS = 5000;
 const BACKUP_REMINDER_DAYS = 30;
 const SEARCH_LIMIT = 200;
 const TREND_MONTHS = 6;
 const CATEGORY_SHORTLIST = 12;
+const MAX_FUTURE_MONTHS = 12;
 const ICON_KEYS = Object.keys(CATEGORY_ICONS);
 
 const today = () => C.toISO(new Date());
@@ -88,6 +90,31 @@ const walletChoices = (selectedId) => {
   return selected?.archived ? [...activeWallets(), selected] : activeWallets();
 };
 
+// ---------- Theme ----------
+
+// Kept apart from the budget data: it belongs to this device, so a restored backup doesn't change it.
+const THEME_KEY = 'budget.theme';
+const THEME_BAR_COLORS = { light: '#f9f9f7', dark: '#0d0d0d' };
+
+function readTheme() {
+  try {
+    return localStorage.getItem(THEME_KEY) || 'auto';
+  } catch {
+    return 'auto';
+  }
+}
+
+function applyTheme(theme) {
+  const root = document.documentElement;
+  if (theme === 'auto') delete root.dataset.theme;
+  else root.dataset.theme = theme;
+  // The two tags in index.html each follow the phone's setting, so a chosen theme overrides both.
+  document.querySelectorAll('meta[name="theme-color"]').forEach((meta) => {
+    const own = meta.media.includes('dark') ? 'dark' : 'light';
+    meta.content = THEME_BAR_COLORS[theme === 'auto' ? own : theme];
+  });
+}
+
 // ---------- Formatting ----------
 
 // Intl shows two decimals for these, but nobody uses fractions of them in practice.
@@ -160,11 +187,11 @@ const badge = (item, size = '') =>
 // ---------- Shared pieces ----------
 
 const monthNav = () => {
-  const atCurrent = ui.month >= C.monthOf(today());
+  const atLimit = ui.month >= C.addMonths(C.monthOf(today()), MAX_FUTURE_MONTHS);
   return html`<div class="month-nav">
     <button class="icon-btn" data-a="monthPrev" aria-label="Previous month">${svg(ICONS.left)}</button>
     <h1>${monthLabel(ui.month)}</h1>
-    <button class="icon-btn" data-a="monthNext" aria-label="Next month" ${atCurrent ? 'disabled' : ''}>${svg(ICONS.right)}</button>
+    <button class="icon-btn" data-a="monthNext" aria-label="Next month" ${atLimit ? 'disabled' : ''}>${svg(ICONS.right)}</button>
   </div>`;
 };
 
@@ -182,7 +209,24 @@ function correctionRow(t) {
   </button>`;
 }
 
+function plannedRow(t) {
+  const c = category(t.categoryId);
+  const w = wallet(t.walletId);
+  const details = [`Planned ${dayMonth(t.date)}`, t.note && c.name, state.wallets.length > 1 && w.name].filter(Boolean);
+  return html`<button class="tx tx-planned" data-a="editRule" data-id="${t.ruleId}">
+    ${badge(c)}
+    <span class="tx-main">
+      <div class="tx-title">${t.note || c.name}</div>
+      <div class="tx-sub">${details.join(' · ')}</div>
+    </span>
+    <span class="tx-amount">${t.estimated ? '≈ ' : ''}${t.type === 'income' ? '+' : '−'}${money(t.amount, w.currency)}
+      ${t.foreignCurrency && html`<div class="tx-sub">${money(t.foreignAmount, t.foreignCurrency)}</div>`}
+    </span>
+  </button>`;
+}
+
 function txRow(t) {
+  if (t.planned) return plannedRow(t);
   if (t.type === 'adjustment') return correctionRow(t);
   const w = wallet(t.walletId);
   if (t.type === 'transfer') {
@@ -206,7 +250,9 @@ function txRow(t) {
       <div class="tx-title">${t.note || c.name}</div>
       <div class="tx-sub">${details.join(' · ')}</div>
     </span>
-    <span class="tx-amount ${t.type}">${t.type === 'income' ? '+' : '−'}${money(t.amount, w.currency)}</span>
+    <span class="tx-amount ${t.type}">${t.type === 'income' ? '+' : '−'}${money(t.amount, w.currency)}
+      ${t.foreignCurrency && html`<div class="tx-sub">${money(t.foreignAmount, t.foreignCurrency)}</div>`}
+    </span>
   </button>`;
 }
 
@@ -233,6 +279,21 @@ const leftText = (spent, limit) =>
 
 const approx = (converted) => (converted ? '≈\u00a0' : '');
 
+const isFutureMonth = () => ui.month > C.monthOf(today());
+const byDate = (list) => [...list].sort((a, b) => a.date.localeCompare(b.date));
+
+// What a month's numbers are built from: real entries, plus planned ones once it's in the future.
+function monthList() {
+  const actual = C.txInMonth(state.tx, ui.month);
+  return isFutureMonth() ? [...actual, ...C.plannedEntries(state, ui.month, today())] : actual;
+}
+
+const plannedNote = (list) =>
+  list.some((t) => t.planned) &&
+  html`<p class="small">${list.some((t) => t.planned && t.foreignCurrency) || list.some((t) => t.planned && wallet(t.walletId).currency !== state.currency)
+    ? "Planned from your recurring items at today's exchange rates, or your own rate where you set one. Amounts change until the payment happens."
+    : 'Planned from your recurring items.'}</p>`;
+
 // Large totals, common in currencies like UAH and IDR, shrink to stay on one line.
 const heroAmount = (text) => {
   const size = text.length <= 11 ? '' : text.length <= 15 ? 'hero-medium' : 'hero-small';
@@ -250,6 +311,13 @@ function currencyOptions(selected) {
   return [...new Set([selected, ...COMMON_CURRENCIES, ...all])].map(
     (code) => html`<option ${code === selected ? 'selected' : ''}>${code}</option>`,
   );
+}
+
+function foreignOptions(selected, walletCurrency) {
+  const all = Intl.supportedValuesOf?.('currency') ?? [];
+  const codes = [...new Set([...COMMON_CURRENCIES, ...(selected ? [selected] : []), ...all])].filter((c) => c !== walletCurrency);
+  return html`<option value="">${walletCurrency} (same as wallet)</option>
+    ${codes.map((code) => html`<option ${code === selected ? 'selected' : ''}>${code}</option>`)}`;
 }
 
 // ---------- Home ----------
@@ -305,14 +373,19 @@ function walletsCard() {
       ${ui.showEmptyWallets ? 'Hide empty wallets' : `Show ${emptyCount} empty ${emptyCount === 1 ? 'wallet' : 'wallets'}`}</button>`}
     <div class="btn-row">
       <button class="btn" data-a="newTransfer">Move money</button>
-      <button class="btn" data-a="openReconcile">Correct balances</button>
+      <button class="btn btn-icon" data-a="openReconcile" aria-label="Correct balances" title="Correct balances">${iconMarkup('wrench')}</button>
     </div>
   </section>`;
 }
 
 function viewHome() {
-  const list = C.sortTx(C.txInMonth(state.tx, ui.month));
-  const { income, expense, byCategory, missing, converted } = C.summarize(state, list);
+  const future = isFutureMonth();
+  const list = C.sortTx(monthList());
+  const stillPlanned = future ? [] : byDate(C.plannedEntries(state, ui.month, today()));
+  const stillTotals = C.summarize(state, stillPlanned);
+  const summary = C.summarize(state, list);
+  const { income, expense, byCategory, missing } = summary;
+  const converted = summary.converted || list.some((t) => t.estimated);
   const limited = state.categories
     .filter((c) => c.kind === 'expense' && c.limit && !c.archived)
     .map((c) => ({ c, spent: byCategory.get(c.id) || 0 }))
@@ -324,7 +397,7 @@ function viewHome() {
   return html`${banners()}${walletsCard()}${monthNav()}
     <section class="card">
       <div>
-        <div class="hero-label">Spent</div>
+        <div class="hero-label">${future ? 'Planned spending' : 'Spent'}</div>
         ${heroAmount(approx(converted) + money(expense))}
       </div>
       ${totalLimit > 0 && html`${budgetBar(limitedSpent, totalLimit)}
@@ -333,6 +406,9 @@ function viewHome() {
         <div><div class="small">Income</div><div class="stat-value">${approx(converted)}${money(income)}</div></div>
         <div><div class="small">Net</div><div class="stat-value">${approx(converted)}${net < 0 ? '−' : ''}${money(Math.abs(net))}</div></div>
       </div>
+      ${stillPlanned.length > 0 && html`<p class="small">Still planned this month: ${
+        [stillTotals.expense && `≈ −${money(stillTotals.expense)}`, stillTotals.income && `≈ +${money(stillTotals.income)}`].filter(Boolean).join(', ')
+      }</p>`}
       ${missingRateNote(missing)}
     </section>
 
@@ -355,24 +431,40 @@ function viewHome() {
         : html`<p class="small">No limits yet. Tap Edit to set a monthly limit for a category.</p>`}
     </section>
 
-    <section>
-      <div class="row-between" style="padding-bottom:8px">
-        <h2 class="section-title">Recent</h2>
-        ${list.length > 5 && html`<button class="link" data-a="tab" data-tab="activity">See all</button>`}
-      </div>
-      <div class="card card-flush">
-        ${list.length
-          ? list.slice(0, 5).map(txRow)
-          : html`<p class="empty">Nothing this month. Tap + to add your first entry.</p>`}
-      </div>
-    </section>`;
+    ${stillPlanned.length > 0 && html`<section class="month-section">
+      <h2 class="section-title">Still planned</h2>
+      <div class="card card-flush">${stillPlanned.map(txRow)}</div>
+      ${plannedNote(stillPlanned)}
+    </section>`}
+
+    ${future
+      ? html`<section class="month-section">
+          <h2 class="section-title">Planned</h2>
+          <div class="card card-flush">
+            ${list.length
+              ? byDate(list).map(txRow)
+              : html`<p class="empty">No recurring payments fall in this month.</p>`}
+          </div>
+          ${plannedNote(list)}
+        </section>`
+      : html`<section>
+          <div class="row-between" style="padding-bottom:8px">
+            <h2 class="section-title">Recent</h2>
+            ${list.length > 5 && html`<button class="link" data-a="seeAll">See all</button>`}
+          </div>
+          <div class="card card-flush">
+            ${list.length
+              ? list.slice(0, 5).map(txRow)
+              : html`<p class="empty">Nothing this month. Tap + to add your first entry.</p>`}
+          </div>
+        </section>`}`;
 }
 
 // ---------- Activity ----------
 
 function activityResults() {
   const q = ui.search.trim().toLowerCase();
-  let list = q ? state.tx : C.txInMonth(state.tx, ui.month);
+  let list = q ? state.tx : [...C.txInMonth(state.tx, ui.month), ...C.plannedEntries(state, ui.month, today())];
   if (ui.filterCat) list = list.filter((t) => t.categoryId === ui.filterCat);
   if (ui.filterWallet) list = list.filter((t) => t.walletId === ui.filterWallet || t.toWalletId === ui.filterWallet);
   if (q) {
@@ -381,16 +473,20 @@ function activityResults() {
       return `${t.note || ''} ${label} ${wallet(t.walletId).name}`.toLowerCase().includes(q);
     });
   }
-  const sorted = C.sortTx(list);
+  // A future month reads like a calendar, soonest first. Everything else is newest first.
+  const sorted = !q && isFutureMonth() ? byDate(list) : C.sortTx(list);
   const shown = sorted.slice(0, q ? SEARCH_LIMIT : undefined);
-  if (!shown.length) return html`<div class="card card-flush"><p class="empty">No matching entries.</p></div>`;
+  if (!shown.length) return html`<div class="card card-flush"><p class="empty">${!q && isFutureMonth() ? 'Nothing planned here.' : 'No matching entries.'}</p></div>`;
   return html`<div class="card card-flush">${txGroups(shown)}</div>
+    ${plannedNote(shown)}
     ${sorted.length > shown.length && html`<p class="small">Showing the latest ${shown.length} of ${sorted.length}.</p>`}`;
 }
 
 function viewActivity() {
   const w = wallet(ui.filterWallet);
-  return html`${w && html`<section class="card">
+  const previous = nav.stack.at(-1);
+  return html`${previous && html`<button class="back-row" data-a="back">${svg(ICONS.left)}${TAB_LABELS[previous.tab]}</button>`}
+    ${w && html`<section class="card">
       <div class="row-between">
         <span class="budget-name">${badge(w, 'badge-small')} ${w.name}</span>
         <button class="link" data-a="editWallet" data-id="${w.id}">Edit</button>
@@ -421,6 +517,7 @@ function viewActivity() {
 
 function trendEnd() {
   const current = C.monthOf(today());
+  if (ui.month > current) return ui.month;
   return ui.month > C.addMonths(current, -TREND_MONTHS) ? current : ui.month;
 }
 
@@ -432,11 +529,12 @@ function barPath(x, y, w, h, r) {
 function trendChart(rows) {
   const W = 340;
   const H = 190;
-  const left = 46;
   const top = 8;
   const bottom = 24;
   const plotH = H - top - bottom;
   const max = C.niceMax(Math.max(...rows.map((r) => Math.max(r.income, r.expense))));
+  // Room for the longest axis label, which depends on the currency and the amounts.
+  const left = Math.max(46, Math.max(...[0, max / 2, max].map((v) => moneyCompact(v).length)) * 6.5 + 8);
   const groupW = (W - left) / rows.length;
   const barW = Math.min(14, (groupW - 10) / 2);
   const yOf = (v) => top + plotH - (v / max) * plotH;
@@ -451,7 +549,7 @@ function trendChart(rows) {
     const gx = left + i * groupW;
     return html`<rect class="hit ${r.key === ui.month ? 'selected' : ''}" x="${gx + 2}" y="0" width="${groupW - 4}" height="${H}" rx="8"
       data-a="pickMonth" data-key="${r.key}" role="button"
-      aria-label="${monthLabel(r.key)}: income ${money(r.income)}, expenses ${money(r.expense)}"></rect>`;
+      aria-label="${monthLabel(r.key)}${r.planned ? ' (planned)' : ''}: income ${money(r.income)}, expenses ${money(r.expense)}"></rect>`;
   });
 
   const bars = rows.map((r, i) => {
@@ -459,7 +557,7 @@ function trendChart(rows) {
     const bar = (value, x, cls) => {
       if (!value) return '';
       const h = Math.max(2, (value / max) * plotH);
-      return html`<path class="${cls}" d="${barPath(x, top + plotH - h, barW, h, 4)}"></path>`;
+      return html`<path class="${cls} ${r.planned ? 'planned' : ''}" d="${barPath(x, top + plotH - h, barW, h, 4)}"></path>`;
     };
     return html`${bar(r.income, cx - barW - 1, 'income')}
       ${bar(r.expense, cx + 1, 'expense')}
@@ -493,7 +591,7 @@ function donut(spent, total, converted) {
   return html`<div class="donut">
     <svg viewBox="0 0 200 200" role="group" aria-label="Spending by category">${slices}</svg>
     <div class="donut-center">
-      <div class="small">${chosen ? chosen.c.name : 'Spent'}</div>
+      <div class="small">${chosen ? chosen.c.name : isFutureMonth() ? 'Planned' : 'Spent'}</div>
       <div class="donut-amount ${center.length > 10 ? 'donut-amount-long' : ''}">${center}</div>
       ${chosen && html`<div class="small">${percent(chosen.amount, total)}</div>`}
     </div>
@@ -503,20 +601,22 @@ function donut(spent, total, converted) {
 const percent = (part, whole) => (part / whole < 0.01 ? '<1%' : `${Math.round((part / whole) * 100)}%`);
 
 function viewInsights() {
-  const s = C.summarize(state, C.txInMonth(state.tx, ui.month));
+  const list = monthList();
+  const s = C.summarize(state, list);
+  const estimated = s.converted || list.some((t) => t.estimated);
   const spent = [...s.byCategory]
     .map(([id, amount]) => ({ c: category(id), amount }))
     .sort((a, b) => b.amount - a.amount);
   const total = spent.reduce((sum, x) => sum + x.amount, 0);
   const top = spent[0]?.amount || 1;
-  const rows = C.trend(state, trendEnd(), TREND_MONTHS);
+  const rows = C.trend(state, trendEnd(), TREND_MONTHS, today());
   const chosen = rows.find((r) => r.key === ui.month);
 
   return html`${monthNav()}
     <section class="card">
-      <h2 class="section-title">Spending</h2>
+      <h2 class="section-title">${isFutureMonth() ? 'Planned spending' : 'Spending'}</h2>
       ${spent.length
-        ? html`${donut(spent, total, s.converted)}
+        ? html`${donut(spent, total, estimated)}
           ${spent.map(
             (x) => html`<button class="cat-bar ${colorClass(x.c.color)}" data-a="openCat" data-id="${x.c.id}">
               <div class="row-between">
@@ -526,8 +626,8 @@ function viewInsights() {
               <div class="bar"><i style="width:${((x.amount / top) * 100).toFixed(1)}%"></i></div>
             </button>`,
           )}`
-        : html`<p class="small">No spending this month.</p>`}
-      ${s.converted && html`<p class="small">Converted to ${state.currency} at your current exchange rates.</p>`}
+        : html`<p class="small">${isFutureMonth() ? 'No planned spending this month.' : 'No spending this month.'}</p>`}
+      ${plannedNote(list) || (s.converted && html`<p class="small">Converted to ${state.currency} at your current exchange rates.</p>`)}
       ${missingRateNote(s.missing)}
     </section>
 
@@ -536,15 +636,16 @@ function viewInsights() {
       <div class="legend">
         <span><i style="background:var(--income)"></i>Income</span>
         <span><i style="background:var(--expense)"></i>Expenses</span>
+        ${rows.some((r) => r.planned) && html`<span>Lighter bars are planned</span>`}
       </div>
       ${trendChart(rows)}
-      ${chosen && html`<p class="small">${monthLabel(chosen.key)}: income ${money(chosen.income)}, expenses ${money(chosen.expense)}</p>`}
+      ${chosen && html`<p class="small">${monthLabel(chosen.key)}${chosen.planned ? ' (planned)' : ''}: income ${money(chosen.income)}, expenses ${money(chosen.expense)}</p>`}
       <details>
         <summary>Show as table</summary>
         <table class="table">
           <thead><tr><th>Month</th><th>Income</th><th>Expenses</th></tr></thead>
           <tbody>${rows.map(
-            (r) => html`<tr><td>${monthShort(r.key)}</td><td>${money(r.income)}</td><td>${money(r.expense)}</td></tr>`,
+            (r) => html`<tr><td>${monthShort(r.key)}${r.planned ? ' (planned)' : ''}</td><td>${money(r.income)}</td><td>${money(r.expense)}</td></tr>`,
           )}</tbody>
         </table>
       </details>
@@ -561,6 +662,9 @@ function ratesStatus() {
 function viewSettings() {
   return html`<h1 class="section-title" style="font-size:28px">Settings</h1>
     <section class="card card-flush">
+      <div class="set-row"><span>Theme</span>
+        ${seg('setTheme', readTheme(), [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']])}
+      </div>
       <label class="set-row"><span>Total currency</span>
         <select class="input" data-change="currency" aria-label="Total currency">${currencyOptions(state.currency)}</select>
       </label>
@@ -585,9 +689,10 @@ function viewSettings() {
 
 // ---------- Sheets ----------
 
-const sheetHead = (title, leftAction, leftLabel, saveAction, saveLabel = 'Save') =>
+// Task forms offer Cancel and screens reached from a list offer Back. Both return to the previous screen.
+const sheetHead = (title, leftLabel, saveAction, saveLabel = 'Save') =>
   html`<header class="sheet-head">
-    <button data-a="${leftAction}">${leftLabel}</button>
+    <button class="head-back" data-a="back">${leftLabel === 'Back' && svg(ICONS.left)}${leftLabel}</button>
     <h2>${title}</h2>
     ${saveAction ? html`<button class="save" data-a="${saveAction}">${saveLabel}</button>` : html`<span></span>`}
   </header>`;
@@ -609,19 +714,23 @@ const walletSelect = (id, label, selectedId, change) =>
 
 function sheetTx(s) {
   const f = s.form;
+  // Wallets can be added or deleted on the way back to this form.
+  if (!wallet(f.walletId)) f.walletId = defaultWalletId();
+  if (!wallet(f.toWalletId)) f.toWalletId = otherWallet(f.walletId);
   const from = wallet(f.walletId);
   const footer = html`<label class="field"><span>Date</span><input id="f-date" class="input" type="date" value="${f.date}"></label>
     <label class="field"><span>Note (optional)</span><input id="f-note" class="input" maxlength="120" value="${f.note}"></label>
     ${s.id && html`<button class="btn btn-danger" data-a="deleteTx">Delete entry</button>`}`;
+  const priced = (f.type !== 'transfer' && f.foreign) || from.currency;
   const amount = html`<div>
-    <input id="f-amount" class="amount-input" inputmode="decimal" autocomplete="off" placeholder="0.00" aria-label="Amount in ${from.currency}" value="${f.amount}">
-    <p class="amount-currency">${from.currency}</p>
+    <input id="f-amount" class="amount-input" inputmode="decimal" autocomplete="off" placeholder="0.00" aria-label="Amount in ${priced}" value="${f.amount}">
+    <p class="amount-currency">${priced}</p>
   </div>`;
 
   if (f.type === 'transfer') {
     const to = wallet(f.toWalletId);
     const rate = to && C.crossRate(state, from.currency, to.currency);
-    return html`${sheetHead(s.id ? 'Edit transfer' : 'Move money', 'closeSheet', 'Cancel', 'saveTx')}
+    return html`${sheetHead(s.id ? 'Edit transfer' : 'Move money', 'Cancel', 'saveTx')}
       <div class="sheet-body">
         ${seg('txType', f.type, TX_TYPE_OPTIONS)}
         ${amount}
@@ -640,6 +749,7 @@ function sheetTx(s) {
       </div>`;
   }
 
+  const chargedRate = f.foreign && C.crossRate(state, f.foreign, from.currency);
   const cats = categoriesByUse(f.type);
   const current = category(f.categoryId);
   // An archived category stays selectable when editing an old entry that uses it.
@@ -649,7 +759,7 @@ function sheetTx(s) {
   const choices = s.allCategories || all.length <= CATEGORY_SHORTLIST
     ? all
     : current && !top.includes(current) && current.kind === f.type ? [...top.slice(0, -1), current] : top;
-  return html`${sheetHead(s.id ? 'Edit entry' : 'New entry', 'closeSheet', 'Cancel', 'saveTx')}
+  return html`${sheetHead(s.id ? 'Edit entry' : 'New entry', 'Cancel', 'saveTx')}
     <div class="sheet-body">
       ${seg('txType', f.type, TX_TYPE_OPTIONS)}
       ${amount}
@@ -660,6 +770,14 @@ function sheetTx(s) {
           ${badge(c)}${c.name}</button>`,
       )}</div>
       ${choices.length < all.length && html`<button type="button" class="btn" data-a="showAllCategories">All categories (${all.length})</button>`}
+      <label class="field"><span>Price in</span>
+        <select id="f-foreign" class="input" data-change="txForm">${foreignOptions(f.foreign, from.currency)}</select>
+      </label>
+      ${f.foreign && html`<label class="field"><span>${f.type === 'income' ? 'Added to' : 'Taken from'} wallet (${from.currency})</span>
+          <input id="f-charged" class="input" inputmode="decimal" autocomplete="off" placeholder="0.00" value="${f.charged}"></label>
+        <p class="small">${chargedRate
+          ? `Today's rate: 1 ${f.foreign} = ${formatRate(chargedRate)} ${from.currency}. Change the amount to match what really moved.`
+          : `No exchange rate saved for ${f.foreign}, so enter the amount that really moved.`}</p>`}
       ${footer}
     </div>`;
 }
@@ -679,7 +797,7 @@ const stylePicker = (f) =>
 function sheetCategories(s) {
   const list = state.categories.filter((c) => c.kind === s.kind);
   const sorted = [...list.filter((c) => !c.archived), ...list.filter((c) => c.archived)];
-  return html`${sheetHead('Categories', 'closeSheet', 'Done')}
+  return html`${sheetHead('Categories', 'Back')}
     <div class="sheet-body">
       ${seg('catKind', s.kind, TYPE_OPTIONS)}
       <div class="card card-flush">${sorted.map(
@@ -694,7 +812,7 @@ function sheetCategories(s) {
 
 function sheetCategory(s) {
   const f = s.form;
-  return html`${sheetHead(s.id ? 'Edit category' : 'New category', 'openCategories', 'Back', 'saveCategory')}
+  return html`${sheetHead(s.id ? 'Edit category' : 'New category', 'Back', 'saveCategory')}
     <div class="sheet-body">
       ${s.error && html`<p class="error">${s.error}</p>`}
       <div class="name-row">
@@ -712,7 +830,7 @@ function sheetCategory(s) {
 function sheetWallets() {
   const bal = C.balances(state);
   const sorted = [...activeWallets(), ...state.wallets.filter((w) => w.archived)];
-  return html`${sheetHead('Wallets', 'closeSheet', 'Done')}
+  return html`${sheetHead('Wallets', 'Back')}
     <div class="sheet-body">
       <div class="card card-flush">${sorted.map(
         (w) => html`<button class="set-row" data-a="editWallet" data-id="${w.id}">
@@ -727,7 +845,7 @@ function sheetWallets() {
 function sheetWallet(s) {
   const f = s.form;
   const used = s.id && walletInUse(s.id);
-  return html`${sheetHead(s.id ? 'Edit wallet' : 'New wallet', 'openWallets', 'Back', 'saveWallet')}
+  return html`${sheetHead(s.id ? 'Edit wallet' : 'New wallet', 'Back', 'saveWallet')}
     <div class="sheet-body">
       ${s.error && html`<p class="error">${s.error}</p>`}
       ${!s.id && html`<div class="presets">${C.WALLET_PRESETS.map(
@@ -756,8 +874,9 @@ function sheetWallet(s) {
 }
 
 function sheetRates() {
-  const codes = [...new Set(activeWallets().map((w) => w.currency))].filter((c) => c !== state.currency).sort();
-  return html`${sheetHead('Exchange rates', 'closeSheet', 'Done')}
+  const used = [...activeWallets().map((w) => w.currency), ...state.recurring.map((r) => r.foreignCurrency).filter(Boolean)];
+  const codes = [...new Set(used)].filter((c) => c !== state.currency).sort();
+  return html`${sheetHead('Exchange rates', 'Back')}
     <div class="sheet-body">
       ${seg('rateMode', state.autoRates ? 'auto' : 'manual', [['auto', 'Automatic'], ['manual', 'Set by me']])}
       ${state.autoRates
@@ -805,7 +924,7 @@ function reconcileSummary(s) {
 function sheetReconcile(s) {
   const bal = C.balances(state);
   const wallets = s.walletId ? [wallet(s.walletId)] : activeWallets();
-  return html`${sheetHead(s.walletId ? 'Correct balance' : 'Correct balances', 'closeSheet', 'Cancel', 'saveReconcile')}
+  return html`${sheetHead(s.walletId ? 'Correct balance' : 'Correct balances', 'Cancel', 'saveReconcile')}
     <div class="sheet-body">
       <p class="small">Type what's really in ${s.walletId ? 'this wallet' : 'each wallet'} now${s.walletId ? '' : ', and leave the rest empty'}. Your old entries don't change. The difference is saved as a correction you can see or undo later, and it doesn't count as income or spending.</p>
       ${s.error && html`<p class="error">${s.error}</p>`}
@@ -832,13 +951,13 @@ function sheetReconcile(s) {
 
 function sheetCorrections() {
   const list = C.sortTx(state.tx.filter((t) => t.type === 'adjustment'));
-  return html`${sheetHead('Balance corrections', 'closeSheet', 'Done')}
+  return html`${sheetHead('Balance corrections', 'Back')}
     <div class="sheet-body">
       <p class="small">Every time a wallet's balance was corrected. Tap one to change its note or undo it.</p>
       ${list.length
         ? html`<div class="card card-flush">${list.map((t) => {
             const w = wallet(t.walletId);
-            return html`<button class="tx tx-wrap" data-a="editCorrection" data-id="${t.id}" data-history="1">
+            return html`<button class="tx tx-wrap" data-a="editCorrection" data-id="${t.id}">
               ${badge(w)}
               <span class="tx-main">
                 <div class="tx-title">${w.name}</div>
@@ -856,7 +975,7 @@ function sheetCorrections() {
 function sheetCorrection(s) {
   const t = state.tx.find((x) => x.id === s.id);
   const w = wallet(t.walletId);
-  return html`${sheetHead('Balance correction', s.fromHistory ? 'openCorrections' : 'closeSheet', s.fromHistory ? 'Back' : 'Cancel', 'saveCorrection')}
+  return html`${sheetHead('Balance correction', 'Back', 'saveCorrection')}
     <div class="sheet-body">
       <div class="card">
         <span class="budget-name">${badge(w, 'badge-small')} ${w.name}</span>
@@ -882,7 +1001,7 @@ const FREQ_LABEL = {
 };
 
 function sheetRecurring() {
-  return html`${sheetHead('Recurring', 'closeSheet', 'Done')}
+  return html`${sheetHead('Recurring', 'Back')}
     <div class="sheet-body">
       ${state.recurring.length
         ? html`<div class="card card-flush">${state.recurring.map((r) => {
@@ -894,7 +1013,10 @@ function sheetRecurring() {
                 <div class="tx-title">${r.note || c.name}</div>
                 <div class="tx-sub">Next ${dayMonth(C.nextOccurrence(r))} · ${FREQ_LABEL[r.freq]} · ${w.name}</div>
               </span>
-              <span class="tx-amount ${r.type}">${r.type === 'income' ? '+' : '−'}${money(r.amount, w.currency)}</span>
+              ${r.foreignCurrency
+                ? html`<span class="tx-amount ${r.type}">${r.type === 'income' ? '+' : '−'}${money(r.foreignAmount, r.foreignCurrency)}
+                    <div class="tx-sub">${r.fixedRate ? '' : '≈ '}${money(C.ruleCharge(state, r), w.currency)}</div></span>`
+                : html`<span class="tx-amount ${r.type}">${r.type === 'income' ? '+' : '−'}${money(r.amount, w.currency)}</span>`}
             </button>`;
           })}</div>`
         : html`<p class="small">Rent, subscriptions and salary can be added automatically each time they come due.</p>`}
@@ -904,12 +1026,28 @@ function sheetRecurring() {
 
 function sheetRule(s) {
   const f = s.form;
-  return html`${sheetHead(s.id ? 'Edit recurring' : 'New recurring', 'openRecurring', 'Back', 'saveRule')}
+  const walletCurrency = wallet(f.walletId).currency;
+  const currentRate = f.foreign && C.crossRate(state, f.foreign, walletCurrency);
+  return html`${sheetHead(s.id ? 'Edit recurring' : 'New recurring', 'Back', 'saveRule')}
     <div class="sheet-body">
       ${seg('ruleType', f.type, TYPE_OPTIONS)}
       ${s.error && html`<p class="error">${s.error}</p>`}
       ${walletSelect('f-wallet', 'Wallet', f.walletId, 'ruleForm')}
-      <label class="field"><span>Amount (${wallet(f.walletId).currency})</span><input id="f-amount" class="input" inputmode="decimal" autocomplete="off" placeholder="0.00" value="${f.amount}"></label>
+      <label class="field"><span>Price in</span>
+        <select id="f-foreign" class="input" data-change="ruleForm">${foreignOptions(f.foreign, walletCurrency)}</select>
+      </label>
+      <label class="field"><span>Amount (${f.foreign || walletCurrency})</span><input id="f-amount" class="input" inputmode="decimal" autocomplete="off" placeholder="0.00" value="${f.amount}"></label>
+      ${f.foreign && html`<div class="field"><span>Exchange rate</span>
+          ${seg('ruleRateMode', f.rateMode, [['current', 'Current rate'], ['fixed', 'My rate']])}
+        </div>
+        ${f.rateMode === 'fixed'
+          ? html`<label class="rate-row rate-row-plain"><span>1 ${f.foreign} =</span>
+              <input id="f-rate" class="input" inputmode="decimal" autocomplete="off" placeholder="Enter rate" aria-label="Value of 1 ${f.foreign} in ${walletCurrency}" value="${f.rate}">
+              <span>${walletCurrency}</span></label>
+            <p class="small">Every payment uses this rate until you change it.</p>`
+          : html`<p class="small">${currentRate
+              ? `Each payment uses the rate on its due date. Today: 1 ${f.foreign} = ${formatRate(currentRate)} ${walletCurrency}.`
+              : `No exchange rate saved for ${f.foreign}. Connect to the internet, or choose My rate.`}</p>`}`}
       <label class="field"><span>Category</span>
         <select id="f-cat" class="input">${activeCategories(f.type).map(
           (c) => html`<option value="${c.id}" ${c.id === f.categoryId ? 'selected' : ''}>${c.name}</option>`,
@@ -924,7 +1062,7 @@ function sheetRule(s) {
         </label>
         <label class="field"><span>First date</span><input id="f-date" class="input" type="date" value="${f.start}"></label>
       </div>
-      <p class="small">A first date in the past adds all the entries since then.</p>
+      <p class="small">A first date in the past adds all the entries since then${f.foreign ? ", all at today's rate" : ''}.</p>
       ${s.id && html`<button class="btn btn-danger" data-a="deleteRule">Stop repeating</button>
         <p class="small">Entries already added stay in your history.</p>`}
     </div>`;
@@ -958,7 +1096,7 @@ function sheetImport(s) {
     result.transfers && `${result.transfers} ${result.transfers === 1 ? 'transfer' : 'transfers'}`,
     result.corrections && `${result.corrections} balance ${result.corrections === 1 ? 'correction' : 'corrections'}`,
   ].filter(Boolean);
-  return html`${sheetHead('Import CSV', 'closeSheet', 'Cancel', ready && 'confirmImport', 'Import')}
+  return html`${sheetHead('Import CSV', 'Cancel', ready && 'confirmImport', 'Import')}
     <div class="sheet-body">
       <p class="small">Match your file's columns. ${s.rows.length} rows found.</p>
       <div class="card">
@@ -1037,10 +1175,74 @@ function render() {
   }
 }
 
+// ---------- Navigation ----------
+
+// Going forward saves the current screen, and going back restores it exactly: same list, same scroll
+// position, and any half-filled form. Each step is also a browser history entry, so iPhone's
+// swipe-back gesture behaves the same as the Back button.
+const nav = { stack: [] };
+
+const TAB_LABELS = { home: 'Home', activity: 'Activity', insights: 'Insights', settings: 'Settings' };
+
+function keepFormValues() {
+  const type = ui.sheet?.type;
+  if (type === 'tx') readTxForm();
+  if (type === 'rule') readRuleForm();
+  if (type === 'category' || type === 'wallet') readStyleForm();
+  if (type === 'reconcile') {
+    ui.sheet.date = $('f-date').value;
+    ui.sheet.note = $('f-note').value;
+  }
+}
+
+function pushScreen() {
+  keepFormValues();
+  nav.stack.push({
+    tab: ui.tab,
+    sheet: ui.sheet,
+    filterCat: ui.filterCat,
+    filterWallet: ui.filterWallet,
+    search: ui.search,
+    scrollY: window.scrollY,
+    sheetScroll: $('sheet').scrollTop,
+  });
+  history.pushState({ depth: nav.stack.length }, '');
+}
+
+function restoreScreen({ scrollY, sheetScroll, ...screen }) {
+  Object.assign(ui, screen);
+  if (ui.filterWallet && !wallet(ui.filterWallet)) ui.filterWallet = '';
+  render();
+  scrollTo(0, scrollY);
+  $('sheet').scrollTop = sheetScroll;
+}
+
+function goBack() {
+  if (!nav.stack.length) return;
+  restoreScreen(nav.stack.pop());
+  history.back();
+}
+
+// Tabs are top-level places, so choosing one forgets the path taken to get here.
+function clearPath() {
+  const depth = nav.stack.length;
+  nav.stack = [];
+  if (depth) history.go(-depth);
+}
+
 function openSheet(sheet) {
+  pushScreen();
   ui.sheet = sheet;
   render();
   $('sheet').scrollTop = 0;
+}
+
+// Opening Activity from another screen, such as a wallet on Home, with a way back to it.
+function openActivity(filters) {
+  pushScreen();
+  Object.assign(ui, { filterCat: '', filterWallet: '', search: '', tab: 'activity' }, filters);
+  render();
+  scrollTo(0, 0);
 }
 
 function toast(message, undoSnapshot) {
@@ -1064,17 +1266,32 @@ async function refreshRates({ force = false } = {}) {
     const age = state.ratesUpdated ? Date.now() - Date.parse(state.ratesUpdated) : Infinity;
     if (!state.autoRates || age < RATES_MAX_AGE_MS) return false;
   }
+  // A bad connection must not hold up recurring items, which wait for this.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RATES_TIMEOUT_MS);
   try {
-    const response = await fetch(RATES_URL);
+    const response = await fetch(RATES_URL, { signal: controller.signal });
     const data = await response.json();
     if (data.result !== 'success' || !C.applyLiveRates(state, data.rates, new Date().toISOString())) return false;
   } catch {
     return false; // Offline: the last saved rates keep working.
+  } finally {
+    clearTimeout(timer);
   }
   save();
   // Redrawing an open form would throw away what is being typed.
   if (!ui.sheet) render();
   return true;
+}
+
+// Rates come first so that recurring items priced in another currency use today's rate.
+async function catchUp({ quiet = false } = {}) {
+  await refreshRates();
+  const added = runRecurring();
+  if (!added) return;
+  // Redrawing an open form would throw away what is being typed. It shows at the next redraw.
+  if (!ui.sheet) render();
+  if (!quiet) toast(`Added ${added} recurring ${added === 1 ? 'entry' : 'entries'}.`);
 }
 
 function setDisplayCurrency(next) {
@@ -1134,13 +1351,12 @@ function startRestore(text) {
   if (!confirm(message)) return;
   const before = snapshot();
   state = next;
-  runRecurring();
   save();
   ui.filterCat = '';
   ui.filterWallet = '';
   render();
   toast(`Restored ${next.tx.length} entries.`, before);
-  refreshRates();
+  catchUp({ quiet: true });
 }
 
 // ---------- Actions ----------
@@ -1153,6 +1369,16 @@ function readTxForm() {
   f.note = $('f-note').value;
   if ($('f-to')) f.toWalletId = $('f-to').value;
   if ($('f-to-amount')) f.toAmount = $('f-to-amount').value;
+  if ($('f-foreign')) f.foreign = $('f-foreign').value;
+  if ($('f-charged')) f.charged = $('f-charged').value;
+}
+
+// Fills in the wallet amount for a foreign price from the rate, until the user types their own number.
+function fillCharged(f) {
+  if (f.chargedEdited || !f.foreign) return;
+  const rate = C.crossRate(state, f.foreign, wallet(f.walletId).currency);
+  const cents = Math.abs(C.parseAmount(f.amount) ?? 0);
+  f.charged = rate && cents ? C.centsToInput(Math.round(cents * rate)) : '';
 }
 
 // Fills in "amount received" from the rate, until the user types their own number.
@@ -1172,6 +1398,8 @@ function readRuleForm() {
   f.note = $('f-note').value;
   f.freq = $('f-freq').value;
   f.start = $('f-date').value;
+  f.foreign = $('f-foreign').value;
+  if ($('f-rate')) f.rate = $('f-rate').value;
 }
 
 // Keeps what has been typed when a tap redraws the category or wallet form.
@@ -1189,17 +1417,32 @@ function openTxForm(type) {
   const walletId = defaultWalletId();
   openSheet({
     type: 'tx',
-    form: { type, amount: '', walletId, toWalletId: otherWallet(walletId), toAmount: '', toEdited: false, categoryId: null, date: today(), note: '' },
+    form: { type, amount: '', walletId, toWalletId: otherWallet(walletId), toAmount: '', toEdited: false, foreign: '', charged: '', chargedEdited: false, categoryId: null, date: today(), note: '' },
   });
   $('f-amount').focus();
 }
 
 const actions = {
+  setTheme({ v }) {
+    try {
+      if (v === 'auto') localStorage.removeItem(THEME_KEY);
+      else localStorage.setItem(THEME_KEY, v);
+    } catch {
+      // Storage is blocked: the theme still applies until the app closes.
+    }
+    applyTheme(v);
+    render();
+  },
   tab({ tab }) {
+    if (nav.stack.length) Object.assign(ui, { filterCat: '', filterWallet: '', search: '' });
+    clearPath();
     ui.tab = tab;
     ui.sheet = null;
     render();
     scrollTo(0, 0);
+  },
+  seeAll() {
+    openActivity({});
   },
   monthPrev() {
     ui.month = C.addMonths(ui.month, -1);
@@ -1221,24 +1464,17 @@ const actions = {
     render();
   },
   openCat({ id }) {
-    ui.filterCat = id;
-    ui.filterWallet = '';
-    ui.search = '';
-    actions.tab({ tab: 'activity' });
+    openActivity({ filterCat: id });
   },
   toggleEmptyWallets() {
     ui.showEmptyWallets = !ui.showEmptyWallets;
     render();
   },
   openWallet({ id }) {
-    ui.filterWallet = id;
-    ui.filterCat = '';
-    ui.search = '';
-    actions.tab({ tab: 'activity' });
+    openActivity({ filterWallet: id });
   },
-  closeSheet() {
-    ui.sheet = null;
-    render();
+  back() {
+    goBack();
   },
 
   // Entries
@@ -1255,7 +1491,10 @@ const actions = {
       id,
       form: {
         type: t.type,
-        amount: C.centsToInput(t.amount),
+        amount: C.centsToInput(t.foreignCurrency ? t.foreignAmount : t.amount),
+        foreign: t.foreignCurrency || '',
+        charged: t.foreignCurrency ? C.centsToInput(t.amount) : '',
+        chargedEdited: Boolean(t.foreignCurrency),
         walletId: t.walletId,
         toWalletId: t.toWalletId ?? otherWallet(t.walletId),
         toAmount: t.toAmount ? C.centsToInput(t.toAmount) : '',
@@ -1271,7 +1510,12 @@ const actions = {
     const f = ui.sheet.form;
     if (f.type !== v) f.categoryId = null;
     f.type = v;
-    if (v === 'transfer') fillReceived(f);
+    if (v === 'transfer') {
+      f.foreign = '';
+      fillReceived(f);
+    } else {
+      fillCharged(f);
+    }
     render();
   },
   showAllCategories() {
@@ -1287,13 +1531,16 @@ const actions = {
     readTxForm();
     const s = ui.sheet;
     const f = s.form;
-    const amount = Math.abs(C.parseAmount(f.amount) ?? 0);
+    const entered = Math.abs(C.parseAmount(f.amount) ?? 0);
     const isTransfer = f.type === 'transfer';
+    const foreign = !isTransfer && f.foreign && f.foreign !== wallet(f.walletId).currency ? f.foreign : null;
+    const amount = foreign ? Math.abs(C.parseAmount(f.charged) ?? 0) : entered;
     const to = isTransfer ? wallet(f.toWalletId) : null;
     const sameCurrency = to?.currency === wallet(f.walletId).currency;
     const toAmount = sameCurrency ? amount : Math.abs(C.parseAmount(f.toAmount) ?? 0);
 
-    if (!amount) s.error = 'Enter an amount.';
+    if (!entered) s.error = 'Enter an amount.';
+    else if (!amount) s.error = `Enter the amount in ${wallet(f.walletId).currency}.`;
     else if (isTransfer && !to) s.error = 'Add a second wallet first.';
     else if (isTransfer && f.toWalletId === f.walletId) s.error = 'Pick two different wallets.';
     else if (isTransfer && !toAmount) s.error = 'Enter the amount received.';
@@ -1311,6 +1558,7 @@ const actions = {
       date: f.date,
       type: f.type,
       amount,
+      ...(foreign && { foreignAmount: entered, foreignCurrency: foreign }),
       walletId: f.walletId,
       note: f.note.trim(),
       ...(isTransfer
@@ -1322,8 +1570,7 @@ const actions = {
     state.lastWalletId = f.walletId;
     save();
     ui.month = C.monthOf(f.date);
-    ui.sheet = null;
-    render();
+    goBack();
     const shown = money(amount, wallet(f.walletId).currency);
     if (s.id) toast('Entry updated.');
     else toast(isTransfer ? `Moved ${shown} to ${to.name}.` : `Added ${shown}.`);
@@ -1332,8 +1579,7 @@ const actions = {
     const before = snapshot();
     state.tx = state.tx.filter((t) => t.id !== ui.sheet.id);
     save();
-    ui.sheet = null;
-    render();
+    goBack();
     toast('Entry deleted.', before);
   },
 
@@ -1360,7 +1606,8 @@ const actions = {
     openCategoryList(ui.sheet?.kind);
   },
   catKind({ v }) {
-    openCategoryList(v);
+    ui.sheet.kind = v;
+    render();
   },
   newCategory() {
     openSheet({
@@ -1398,14 +1645,14 @@ const actions = {
     if (s.id) Object.assign(category(s.id), data);
     else state.categories.push({ id: C.uid(), kind: s.kind, ...data });
     save();
-    openCategoryList(s.kind);
+    goBack();
   },
   toggleArchive() {
     const s = ui.sheet;
     const c = category(s.id);
     c.archived = !c.archived;
     save();
-    openCategoryList(s.kind);
+    goBack();
   },
 
   // Wallets
@@ -1446,7 +1693,7 @@ const actions = {
     if (s.id) Object.assign(wallet(s.id), data);
     else state.wallets.push({ id: C.uid(), ...data });
     save();
-    openSheet({ type: 'wallets' });
+    goBack();
   },
   toggleWalletHidden() {
     const s = ui.sheet;
@@ -1460,9 +1707,8 @@ const actions = {
       return;
     }
     w.archived = !w.archived;
-    if (ui.filterWallet === w.id) ui.filterWallet = '';
     save();
-    openSheet({ type: 'wallets' });
+    goBack();
   },
   deleteWallet() {
     const s = ui.sheet;
@@ -1474,9 +1720,8 @@ const actions = {
     }
     const before = snapshot();
     state.wallets = state.wallets.filter((w) => w.id !== s.id);
-    if (ui.filterWallet === s.id) ui.filterWallet = '';
     save();
-    openSheet({ type: 'wallets' });
+    goBack();
     toast('Wallet deleted.', before);
   },
 
@@ -1506,16 +1751,15 @@ const actions = {
       return;
     }
     save();
-    ui.sheet = null;
-    render();
+    goBack();
     toast(`Corrected ${added.length} ${added.length === 1 ? 'wallet' : 'wallets'}.`, before);
   },
   openCorrections() {
     openSheet({ type: 'corrections' });
   },
-  editCorrection({ id, history }) {
+  editCorrection({ id }) {
     const t = state.tx.find((x) => x.id === id);
-    openSheet({ type: 'correction', id, fromHistory: Boolean(history), date: t.date, note: t.note || '' });
+    openSheet({ type: 'correction', id, date: t.date, note: t.note || '' });
   },
   saveCorrection() {
     const s = ui.sheet;
@@ -1528,16 +1772,14 @@ const actions = {
     }
     Object.assign(state.tx.find((t) => t.id === s.id), { date, note: $('f-note').value.trim() });
     save();
-    if (s.fromHistory) openSheet({ type: 'corrections' });
-    else actions.closeSheet();
+    goBack();
   },
   deleteCorrection() {
     const s = ui.sheet;
     const before = snapshot();
     state.tx = state.tx.filter((t) => t.id !== s.id);
     save();
-    if (s.fromHistory) openSheet({ type: 'corrections' });
-    else actions.closeSheet();
+    goBack();
     toast('Correction undone.', before);
   },
 
@@ -1568,6 +1810,9 @@ const actions = {
         type: 'expense',
         walletId: defaultWalletId(),
         amount: '',
+        foreign: '',
+        rateMode: 'current',
+        rate: '',
         categoryId: activeCategories('expense')[0]?.id,
         note: '',
         freq: 'monthly',
@@ -1580,8 +1825,21 @@ const actions = {
     openSheet({
       type: 'rule',
       id,
-      form: { type: r.type, walletId: r.walletId, amount: C.centsToInput(r.amount), categoryId: r.categoryId, note: r.note, freq: r.freq, start: r.start },
+      form: {
+        foreign: r.foreignCurrency || '',
+        rateMode: r.fixedRate ? 'fixed' : 'current',
+        rate: r.fixedRate ? formatRate(r.fixedRate) : '',
+        type: r.type, walletId: r.walletId, amount: C.centsToInput(r.foreignCurrency ? r.foreignAmount : r.amount), categoryId: r.categoryId, note: r.note, freq: r.freq, start: r.start,
+      },
     });
+  },
+  ruleRateMode({ v }) {
+    readRuleForm();
+    const f = ui.sheet.form;
+    f.rateMode = v;
+    const current = f.foreign && C.crossRate(state, f.foreign, wallet(f.walletId).currency);
+    if (v === 'fixed' && !f.rate && current) f.rate = formatRate(current);
+    render();
   },
   ruleType({ v }) {
     readRuleForm();
@@ -1594,8 +1852,14 @@ const actions = {
     readRuleForm();
     const s = ui.sheet;
     const f = s.form;
-    const amount = Math.abs(C.parseAmount(f.amount) ?? 0);
-    if (!amount) s.error = 'Enter an amount.';
+    const entered = Math.abs(C.parseAmount(f.amount) ?? 0);
+    const walletCurrency = wallet(f.walletId).currency;
+    const foreign = f.foreign && f.foreign !== walletCurrency ? f.foreign : null;
+    const fixedRate = foreign && f.rateMode === 'fixed' ? C.parseRate(f.rate) : null;
+    const rate = foreign ? fixedRate || (f.rateMode === 'current' && C.crossRate(state, foreign, walletCurrency)) : 1;
+    if (!entered) s.error = 'Enter an amount.';
+    else if (foreign && f.rateMode === 'fixed' && !fixedRate) s.error = 'Enter your exchange rate.';
+    else if (!rate) s.error = `No exchange rate saved for ${foreign}. Choose My rate and enter one.`;
     else if (!f.categoryId) s.error = 'Pick a category.';
     else if (!f.start) s.error = 'Pick a first date.';
     else s.error = null;
@@ -1603,19 +1867,30 @@ const actions = {
       render();
       return;
     }
-    const data = { type: f.type, walletId: f.walletId, amount, categoryId: f.categoryId, note: f.note.trim(), freq: f.freq, start: f.start };
+    const data = {
+      type: f.type,
+      walletId: f.walletId,
+      amount: foreign ? Math.max(1, Math.round(entered * rate)) : entered,
+      foreignAmount: foreign ? entered : undefined,
+      foreignCurrency: foreign || undefined,
+      fixedRate: fixedRate || undefined,
+      categoryId: f.categoryId,
+      note: f.note.trim(),
+      freq: f.freq,
+      start: f.start,
+    };
     if (s.id) Object.assign(state.recurring.find((r) => r.id === s.id), data);
     else state.recurring.push({ id: C.uid(), lastRun: null, ...data });
     const added = runRecurring();
     save();
-    openSheet({ type: 'recurring' });
+    goBack();
     if (added) toast(`Added ${added} ${added === 1 ? 'entry' : 'entries'} that came due.`);
   },
   deleteRule() {
     const before = snapshot();
     state.recurring = state.recurring.filter((r) => r.id !== ui.sheet.id);
     save();
-    openSheet({ type: 'recurring' });
+    goBack();
     toast('Stopped repeating.', before);
   },
 
@@ -1642,6 +1917,7 @@ const actions = {
     // Entries most likely belong in the busiest imported wallet from now on.
     if (newWallets[0] && !newWallets[0].archived) state.lastWalletId = newWallets[0].id;
     save();
+    clearPath();
     ui.sheet = null;
     ui.tab = 'home';
     if (tx.length) ui.month = C.monthOf(C.sortTx(tx)[0].date);
@@ -1653,7 +1929,9 @@ const actions = {
     state = JSON.parse(toast.snapshot);
     save();
     $('toast').hidden = true;
-    render();
+    // A form for something the undo may have removed can't stay open.
+    if (ui.sheet?.id) goBack();
+    else render();
     toast('Undone.');
   },
 };
@@ -1687,10 +1965,15 @@ const changes = {
     if (f.toWalletId === f.walletId) f.toWalletId = otherWallet(f.walletId);
     f.toEdited = false;
     fillReceived(f);
+    if (f.foreign === wallet(f.walletId).currency) f.foreign = '';
+    f.chargedEdited = false;
+    fillCharged(f);
     render();
   },
   ruleForm() {
     readRuleForm();
+    const f = ui.sheet.form;
+    if (f.foreign === wallet(f.walletId).currency) f.foreign = '';
     render();
   },
   importWallet(el) {
@@ -1713,6 +1996,21 @@ const changes = {
 
 // ---------- Wiring ----------
 
+// Swipe-back and the browser's own back button. Going back here has often already been drawn by
+// goBack, which leaves nothing to do. Forward history has no saved screen, so it's sent straight back.
+window.addEventListener('popstate', (e) => {
+  const depth = e.state?.depth ?? 0;
+  if (depth > nav.stack.length) {
+    history.go(nav.stack.length - depth);
+    return;
+  }
+  if (depth === nav.stack.length) return;
+  let screen;
+  while (nav.stack.length > depth) screen = nav.stack.pop();
+  restoreScreen(screen);
+});
+history.replaceState({ depth: 0 }, '');
+
 document.addEventListener('click', (e) => {
   const el = e.target.closest('[data-a]');
   if (el && !el.disabled) actions[el.dataset.a](el.dataset, el);
@@ -1734,6 +2032,12 @@ document.addEventListener('input', (e) => {
   }
   const form = ui.sheet?.form;
   if (form && e.target.id === 'f-to-amount') form.toEdited = true;
+  if (form && e.target.id === 'f-charged') form.chargedEdited = true;
+  if (form && e.target.id === 'f-amount' && $('f-charged')) {
+    form.amount = e.target.value;
+    fillCharged(form);
+    if (!form.chargedEdited) $('f-charged').value = form.charged;
+  }
   if (form && e.target.id === 'f-amount' && $('f-to-amount')) {
     form.amount = e.target.value;
     fillReceived(form);
@@ -1763,15 +2067,12 @@ $('restore-json').addEventListener('change', (e) => readPicked(e.target, startRe
 
 // The app may stay open in the background for days, so check for due items whenever it returns.
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible') return;
-  if (!ui.sheet && runRecurring()) render();
-  refreshRates();
+  if (document.visibilityState === 'visible') catchUp();
 });
 
-const added = runRecurring();
+applyTheme(readTheme());
 render();
-if (added) toast(`Added ${added} recurring ${added === 1 ? 'entry' : 'entries'}.`);
-refreshRates();
+catchUp();
 
 navigator.storage?.persist?.();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');

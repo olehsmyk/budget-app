@@ -189,7 +189,10 @@ export function validateBackup(input) {
     if (c.limit !== null && c.limit !== undefined && !isAmount(c.limit)) fail('bad budget limit');
     ids.add(c.id);
   }
+  const validForeign = (x) =>
+    x.foreignCurrency === undefined || x.foreignCurrency === null || (isCurrency(x.foreignCurrency) && isAmount(x.foreignAmount));
   for (const t of o.tx) {
+    if (!validForeign(t)) fail('bad foreign price');
     if (!t.id || !isDate(t.date) || !isAmount(t.amount) || !walletIds.has(t.walletId)) fail('bad transaction');
     if (t.type === 'transfer') {
       if (!walletIds.has(t.toWalletId) || !isAmount(t.toAmount)) fail('bad transfer');
@@ -200,6 +203,10 @@ export function validateBackup(input) {
     }
   }
   for (const r of o.recurring) {
+    if (!validForeign(r)) fail('bad foreign price');
+    if (r.fixedRate !== undefined && r.fixedRate !== null && !(Number.isFinite(r.fixedRate) && r.fixedRate > 0)) {
+      fail('bad exchange rate');
+    }
     if (
       !r.id ||
       !isDate(r.start) ||
@@ -347,16 +354,55 @@ export function nextOccurrence(rule) {
   }
 }
 
+// What a rule takes from its wallet, in the wallet's currency. A foreign price uses the rule's own
+// rate if it has one, then the current rate. With neither, the last charge is the best estimate left.
+export function ruleCharge(state, rule) {
+  if (!rule.foreignCurrency) return rule.amount;
+  const currency = state.wallets.find((w) => w.id === rule.walletId).currency;
+  const rate = rule.fixedRate || crossRate(state, rule.foreignCurrency, currency);
+  return rate ? Math.max(1, Math.round(rule.foreignAmount * rate)) : rule.amount;
+}
+
+// Recurring payments still to come in a month, at today's rates. These are a forecast only: they
+// are built fresh each time and never stored, so balances change only when a payment really comes due.
+export function plannedEntries(state, monthKey, today) {
+  const out = [];
+  for (const rule of state.recurring) {
+    for (let n = 0; ; n++) {
+      const date = occurrence(rule.start, rule.freq, n);
+      const month = monthOf(date);
+      if (month > monthKey) break;
+      if (month !== monthKey || date <= today || (rule.lastRun && date <= rule.lastRun)) continue;
+      out.push({
+        id: `planned:${rule.id}:${date}`,
+        planned: true,
+        ruleId: rule.id,
+        estimated: Boolean(rule.foreignCurrency && !rule.fixedRate),
+        date,
+        type: rule.type,
+        amount: ruleCharge(state, rule),
+        ...(rule.foreignCurrency && { foreignAmount: rule.foreignAmount, foreignCurrency: rule.foreignCurrency }),
+        walletId: rule.walletId,
+        categoryId: rule.categoryId,
+        note: rule.note,
+      });
+    }
+  }
+  return out;
+}
+
 // Adds every transaction that has come due, and returns how many were added.
 export function applyRecurring(state, today) {
   let added = 0;
   for (const rule of state.recurring) {
     for (let date = nextOccurrence(rule); date <= today; date = nextOccurrence(rule)) {
+      rule.amount = ruleCharge(state, rule);
       state.tx.push({
         id: uid(),
         date,
         type: rule.type,
         amount: rule.amount,
+        ...(rule.foreignCurrency && { foreignAmount: rule.foreignAmount, foreignCurrency: rule.foreignCurrency }),
         walletId: rule.walletId,
         categoryId: rule.categoryId,
         note: rule.note,
@@ -396,12 +442,16 @@ export function summarize(state, txs) {
   return out;
 }
 
-export function trend(state, endKey, months) {
+// With `today`, months after it also include their planned payments.
+export function trend(state, endKey, months, today = null) {
   const rows = [];
   for (let i = months - 1; i >= 0; i--) {
     const key = addMonths(endKey, -i);
-    const { income, expense } = summarize(state, txInMonth(state.tx, key));
-    rows.push({ key, income, expense });
+    const planned = Boolean(today) && key > monthOf(today);
+    const list = txInMonth(state.tx, key);
+    if (planned) list.push(...plannedEntries(state, key, today));
+    const { income, expense } = summarize(state, list);
+    rows.push({ key, income, expense, planned });
   }
   return rows;
 }
@@ -488,7 +538,7 @@ const unguardFormula = (s) => (/^'[=+\-@\t\r]/.test(s) ? s.slice(1) : s);
 export function toCSV(state) {
   const names = new Map(state.categories.map((c) => [c.id, c.name]));
   const wallets = new Map(state.wallets.map((w) => [w.id, w]));
-  const rows = [['date', 'type', 'wallet', 'amount', 'currency', 'category', 'note', 'to_wallet', 'to_amount', 'to_currency']];
+  const rows = [['date', 'type', 'wallet', 'amount', 'currency', 'category', 'note', 'to_wallet', 'to_amount', 'to_currency', 'foreign_amount', 'foreign_currency']];
   for (const t of sortTx(state.tx)) {
     const from = wallets.get(t.walletId);
     const to = wallets.get(t.toWalletId);
@@ -503,6 +553,8 @@ export function toCSV(state) {
       to ? guardFormula(to.name) : '',
       to ? (t.toAmount / 100).toFixed(2) : '',
       to ? to.currency : '',
+      t.foreignCurrency ? (t.foreignAmount / 100).toFixed(2) : '',
+      t.foreignCurrency || '',
     ]);
   }
   return rows.map((r) => r.map(csvCell).join(',')).join('\r\n') + '\r\n';

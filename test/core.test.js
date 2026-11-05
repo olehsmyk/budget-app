@@ -652,3 +652,156 @@ test('CSV export shows corrections signed, and importing that file skips and rep
   assert.equal(out.tx.length, 0);
   assert.equal(out.corrections, 2);
 });
+
+function foreignRule(extra = {}) {
+  return { id: 'r', start: '2026-10-15', freq: 'monthly', lastRun: null, type: 'expense', amount: 1, foreignAmount: 2000, foreignCurrency: 'USD', walletId: 'eur', categoryId: 'c0', note: 'Spotify', ...extra };
+}
+
+test('a foreign-priced rule takes the current rate on each due date, and the charge changes with it', () => {
+  const state = multiCurrencyState(); // the EUR wallet, with 1 USD = 0.9 EUR
+  state.recurring.push(foreignRule());
+
+  assert.equal(C.applyRecurring(state, '2026-10-20'), 1);
+  assert.deepEqual([state.tx[0].amount, state.tx[0].foreignAmount, state.tx[0].foreignCurrency], [1800, 2000, 'USD']);
+
+  state.rates.USD = 1; // the dollar got stronger
+  assert.equal(C.applyRecurring(state, '2026-11-20'), 1);
+  assert.equal(state.tx[1].amount, 2000);
+  assert.equal(state.tx[0].amount, 1800, 'past payments keep what they really took');
+});
+
+test('a rule with its own rate ignores market rates', () => {
+  const state = multiCurrencyState();
+  state.recurring.push(foreignRule({ fixedRate: 1.5 }));
+  C.applyRecurring(state, '2026-10-20');
+  assert.equal(state.tx[0].amount, 3000);
+  state.rates.USD = 100;
+  assert.equal(C.ruleCharge(state, state.recurring[0]), 3000);
+});
+
+test('with no rate anywhere, a rule repeats its last charge instead of failing', () => {
+  const state = multiCurrencyState();
+  delete state.rates.USD;
+  state.recurring.push(foreignRule({ amount: 1234 }));
+  assert.equal(C.applyRecurring(state, '2026-10-20'), 1);
+  assert.equal(state.tx[0].amount, 1234);
+  assert.equal(state.tx[0].foreignAmount, 2000);
+});
+
+test('rates work when the wallet currency differs from the display currency', () => {
+  const state = multiCurrencyState();
+  state.recurring.push(foreignRule({ walletId: 'idr' }));
+  assert.equal(C.ruleCharge(state, state.recurring[0]), 36000000); // $20 at 18,000 IDR per USD
+});
+
+test('plain rules are untouched and have no foreign fields', () => {
+  const state = multiCurrencyState();
+  state.recurring.push({ id: 'p', start: '2026-10-15', freq: 'monthly', lastRun: null, type: 'expense', amount: 500, walletId: 'eur', categoryId: 'c0', note: '' });
+  C.applyRecurring(state, '2026-10-20');
+  assert.equal(state.tx[0].amount, 500);
+  assert.equal('foreignAmount' in state.tx[0], false);
+});
+
+test('a foreign price only affects the money taken: balances and spending use the wallet amount', () => {
+  const state = multiCurrencyState();
+  state.tx.push({ id: 't', date: '2026-11-01', type: 'expense', amount: 1800, foreignAmount: 2000, foreignCurrency: 'USD', walletId: 'eur', categoryId: 'c0', note: '' });
+  assert.equal(C.balances(state).get('eur'), 100000 - 1800);
+  assert.equal(C.summarize(state, state.tx).expense, 1800);
+});
+
+test('foreign prices survive a backup, and bad ones are rejected', () => {
+  const state = multiCurrencyState();
+  state.recurring.push(foreignRule({ fixedRate: 1.5 }));
+  C.applyRecurring(state, '2026-10-20');
+  const copy = C.validateBackup(JSON.parse(JSON.stringify(state)));
+  assert.equal(copy.tx[0].foreignAmount, 2000);
+  assert.equal(copy.recurring[0].fixedRate, 1.5);
+
+  const bad = (change) => JSON.parse(JSON.stringify({ ...state, ...change }));
+  assert.throws(() => C.validateBackup(bad({ tx: [{ ...state.tx[0], foreignCurrency: 'dollars' }] })));
+  assert.throws(() => C.validateBackup(bad({ tx: [{ ...state.tx[0], foreignAmount: -5 }] })));
+  assert.throws(() => C.validateBackup(bad({ recurring: [foreignRule({ fixedRate: -1 })] })));
+});
+
+test('CSV export includes the foreign price, and the extra columns still import correctly', () => {
+  const state = multiCurrencyState();
+  state.tx.push({ id: 't', date: '2026-11-01', type: 'expense', amount: 1800, foreignAmount: 2000, foreignCurrency: 'USD', walletId: 'eur', categoryId: 'c0', note: 'Spotify' });
+  const csv = C.toCSV(state);
+  assert.match(csv, /2026-11-01,expense,Main,18\.00,EUR,Groceries,Spotify,,,,20\.00,USD/);
+
+  const [headers, ...rows] = C.parseCSV(csv);
+  const out = C.buildImport(rows, C.guessMapping(headers), 'ymd', state.categories, state.wallets, 'eur');
+  assert.deepEqual([out.tx[0].amount, out.tx[0].walletId, out.mismatched], [1800, 'eur', 0]);
+});
+
+function plannedState() {
+  const state = multiCurrencyState(); // the EUR wallet, with 1 USD = 0.9 EUR
+  state.recurring.push(foreignRule({ start: '2026-10-15', lastRun: '2026-10-15' }));
+  state.recurring.push({ id: 'phone', start: '2026-10-24', freq: 'fourWeeks', lastRun: '2026-10-24', type: 'expense', amount: 500, walletId: 'eur', categoryId: 'c0', note: 'Phone' });
+  return state;
+}
+
+test('next month shows every recurring payment, using today\'s rate', () => {
+  const list = C.plannedEntries(plannedState(), '2026-12', '2026-11-06');
+  assert.deepEqual(list.map((t) => [t.date, t.amount, t.note, t.estimated, t.planned]), [
+    ['2026-12-15', 1800, 'Spotify', true, true],
+    ['2026-12-19', 500, 'Phone', false, true],
+  ]);
+  assert.deepEqual([list[0].foreignAmount, list[0].foreignCurrency], [2000, 'USD']);
+});
+
+test('a planned amount follows today\'s rate until the payment really happens', () => {
+  const state = plannedState();
+  state.rates.USD = 1;
+  assert.equal(C.plannedEntries(state, '2026-12', '2026-11-06')[0].amount, 2000);
+});
+
+test('a rule with its own rate plans at that rate and is not marked as an estimate', () => {
+  const state = multiCurrencyState();
+  state.recurring.push(foreignRule({ fixedRate: 1.5, lastRun: '2026-10-15' }));
+  const [t] = C.plannedEntries(state, '2026-12', '2026-11-06');
+  assert.deepEqual([t.amount, t.estimated], [3000, false]);
+});
+
+test('this month shows only payments still to come, and past months show none', () => {
+  const state = plannedState();
+  assert.deepEqual(C.plannedEntries(state, '2026-11', '2026-11-16').map((t) => t.date), ['2026-11-21']);
+  assert.deepEqual(C.plannedEntries(state, '2026-11', '2026-11-06').map((t) => t.date), ['2026-11-15', '2026-11-21']);
+  assert.deepEqual(C.plannedEntries(state, '2026-10', '2026-11-06'), []);
+});
+
+test('a payment that already happened is never also planned, and today counts as happened', () => {
+  const state = plannedState();
+  C.applyRecurring(state, '2026-11-15');
+  assert.deepEqual(C.plannedEntries(state, '2026-11', '2026-11-15').map((t) => t.note), ['Phone']);
+});
+
+test('planning changes nothing: no stored entries, and balances stay the same', () => {
+  const state = plannedState();
+  const before = JSON.stringify(state);
+  C.plannedEntries(state, '2027-06', '2026-11-06');
+  C.trend(state, '2027-06', 6, '2026-11-06');
+  assert.equal(JSON.stringify(state), before);
+});
+
+test('rules starting later appear only from their first date', () => {
+  const state = multiCurrencyState();
+  state.recurring.push({ id: 'y', start: '2027-02-10', freq: 'yearly', lastRun: null, type: 'income', amount: 700, walletId: 'eur', categoryId: 'c10', note: '' });
+  assert.deepEqual(C.plannedEntries(state, '2027-01', '2026-11-06'), []);
+  assert.equal(C.plannedEntries(state, '2027-02', '2026-11-06')[0].date, '2027-02-10');
+  assert.deepEqual(C.plannedEntries(state, '2027-03', '2026-11-06'), []);
+});
+
+test('planned entries total up, and only future months count them in the trend', () => {
+  const state = plannedState();
+  const s = C.summarize(state, C.plannedEntries(state, '2026-12', '2026-11-06'));
+  assert.equal(s.expense, 2300);
+  assert.equal(s.byCategory.get('c0'), 2300);
+
+  const rows = C.trend(state, '2026-12', 3, '2026-11-06');
+  assert.deepEqual(rows.map((r) => [r.key, r.expense, r.planned]), [
+    ['2026-10', 0, false],
+    ['2026-11', 0, false],
+    ['2026-12', 2300, true],
+  ]);
+});
