@@ -143,6 +143,7 @@ const ICONS = {
   left: 'M15 5l-7 7 7 7',
   right: 'M9 5l7 7-7 7',
   swap: 'M7 4L3 8l4 4M3 8h14M17 12l4 4-4 4M21 16H7',
+  scale: 'M12 3v18M7 21h10M5 7h14M5 7l-3 7a3 3 0 0 0 6 0L5 7M19 7l-3 7a3 3 0 0 0 6 0l-3-7',
 };
 
 // Icon and color names can come from an imported file, so both are looked up, never inserted as given.
@@ -167,7 +168,22 @@ const monthNav = () => {
   </div>`;
 };
 
+const signedMoney = (cents, currency) => `${cents > 0 ? '+' : cents < 0 ? '−' : ''}${money(Math.abs(cents), currency)}`;
+
+function correctionRow(t) {
+  const w = wallet(t.walletId);
+  return html`<button class="tx" data-a="editCorrection" data-id="${t.id}">
+    <span class="tx-icon" aria-hidden="true">${svg(ICONS.scale)}</span>
+    <span class="tx-main">
+      <div class="tx-title">${t.note || 'Balance correction'}</div>
+      <div class="tx-sub">${t.note ? 'Balance correction · ' : ''}${w.name}</div>
+    </span>
+    <span class="tx-amount ${t.increase ? 'income' : ''}">${signedMoney(t.increase ? t.amount : -t.amount, w.currency)}</span>
+  </button>`;
+}
+
 function txRow(t) {
+  if (t.type === 'adjustment') return correctionRow(t);
   const w = wallet(t.walletId);
   if (t.type === 'transfer') {
     const to = wallet(t.toWalletId);
@@ -287,7 +303,10 @@ function walletsCard() {
     })}</div>
     ${withMoney.length > 0 && emptyCount > 0 && html`<button class="link" data-a="toggleEmptyWallets">
       ${ui.showEmptyWallets ? 'Hide empty wallets' : `Show ${emptyCount} empty ${emptyCount === 1 ? 'wallet' : 'wallets'}`}</button>`}
-    <button class="btn" data-a="newTransfer">Move money</button>
+    <div class="btn-row">
+      <button class="btn" data-a="newTransfer">Move money</button>
+      <button class="btn" data-a="openReconcile">Correct balances</button>
+    </div>
   </section>`;
 }
 
@@ -358,7 +377,7 @@ function activityResults() {
   if (ui.filterWallet) list = list.filter((t) => t.walletId === ui.filterWallet || t.toWalletId === ui.filterWallet);
   if (q) {
     list = list.filter((t) => {
-      const label = t.type === 'transfer' ? 'transfer' : category(t.categoryId).name;
+      const label = t.type === 'transfer' ? 'transfer' : t.type === 'adjustment' ? 'balance correction' : category(t.categoryId).name;
       return `${t.note || ''} ${label} ${wallet(t.walletId).name}`.toLowerCase().includes(q);
     });
   }
@@ -377,6 +396,7 @@ function viewActivity() {
         <button class="link" data-a="editWallet" data-id="${w.id}">Edit</button>
       </div>
       ${heroAmount(money(C.balances(state).get(w.id), w.currency))}
+      <button class="btn" data-a="openReconcile" data-wallet="${w.id}">Correct balance</button>
     </section>`}
     ${!ui.search.trim() && monthNav()}
     <div class="filters">
@@ -549,6 +569,8 @@ function viewSettings() {
       <button class="set-row" data-a="openCategories"><span>Categories and limits</span><span class="chev">›</span></button>
       <button class="set-row" data-a="openRecurring"><span>Recurring</span>
         <span class="value">${state.recurring.length} ›</span></button>
+      <button class="set-row" data-a="openCorrections"><span>Balance corrections</span>
+        <span class="value">${state.tx.filter((t) => t.type === 'adjustment').length} ›</span></button>
     </section>
 
     <section class="card card-flush">
@@ -755,6 +777,100 @@ function sheetRates() {
     </div>`;
 }
 
+// Text under a wallet's input while correcting: what would change.
+function reconcileDifference(w, balance, text) {
+  if (!text.trim()) return '';
+  const actual = C.parseAmount(text);
+  if (actual === null) return "That doesn't look like an amount.";
+  return actual === balance ? 'Already correct' : `Difference: ${signedMoney(actual - balance, w.currency)}`;
+}
+
+function reconcileSummary(s) {
+  const bal = C.balances(state);
+  let count = 0;
+  let total = 0;
+  let converted = false;
+  for (const [id, text] of Object.entries(s.values)) {
+    const actual = text.trim() ? C.parseAmount(text) : null;
+    if (actual === null || actual === bal.get(id)) continue;
+    count++;
+    const value = C.convert(state, actual - bal.get(id), wallet(id).currency);
+    if (value !== null) total += value;
+    if (wallet(id).currency !== state.currency) converted = true;
+  }
+  if (!count) return 'Nothing to correct yet.';
+  return `${count} ${count === 1 ? 'wallet' : 'wallets'} will change. Your total moves by ${approx(converted)}${signedMoney(total)}.`;
+}
+
+function sheetReconcile(s) {
+  const bal = C.balances(state);
+  const wallets = s.walletId ? [wallet(s.walletId)] : activeWallets();
+  return html`${sheetHead(s.walletId ? 'Correct balance' : 'Correct balances', 'closeSheet', 'Cancel', 'saveReconcile')}
+    <div class="sheet-body">
+      <p class="small">Type what's really in ${s.walletId ? 'this wallet' : 'each wallet'} now${s.walletId ? '' : ', and leave the rest empty'}. Your old entries don't change. The difference is saved as a correction you can see or undo later, and it doesn't count as income or spending.</p>
+      ${s.error && html`<p class="error">${s.error}</p>`}
+      <div class="card card-flush">${wallets.map(
+        (w) => html`<label class="reconcile-row">
+          ${badge(w)}
+          <span class="reconcile-main">
+            <span class="tx-title">${w.name}</span>
+            <span class="tx-sub">In the app: ${money(bal.get(w.id), w.currency)}</span>
+            <span class="reconcile-diff" data-diff="${w.id}">${reconcileDifference(w, bal.get(w.id), s.values[w.id] || '')}</span>
+          </span>
+          <span class="reconcile-input">
+            <input class="input" inputmode="decimal" autocomplete="off" placeholder="Real ${w.currency}" aria-label="Real balance of ${w.name} in ${w.currency}" data-reconcile="${w.id}" value="${s.values[w.id] || ''}">
+          </span>
+        </label>`,
+      )}</div>
+      <p class="reconcile-summary" id="reconcile-summary">${reconcileSummary(s)}</p>
+      <div class="two-col">
+        <label class="field"><span>Date</span><input id="f-date" class="input" type="date" value="${s.date}"></label>
+        <label class="field"><span>Note (optional)</span><input id="f-note" class="input" maxlength="120" placeholder="Counted my cash" value="${s.note}"></label>
+      </div>
+    </div>`;
+}
+
+function sheetCorrections() {
+  const list = C.sortTx(state.tx.filter((t) => t.type === 'adjustment'));
+  return html`${sheetHead('Balance corrections', 'closeSheet', 'Done')}
+    <div class="sheet-body">
+      <p class="small">Every time a wallet's balance was corrected. Tap one to change its note or undo it.</p>
+      ${list.length
+        ? html`<div class="card card-flush">${list.map((t) => {
+            const w = wallet(t.walletId);
+            return html`<button class="tx tx-wrap" data-a="editCorrection" data-id="${t.id}" data-history="1">
+              ${badge(w)}
+              <span class="tx-main">
+                <div class="tx-title">${w.name}</div>
+                <div class="tx-sub">${shortDate(t.date)}${t.note ? ` · ${t.note}` : ''}</div>
+                <div class="tx-sub">${money(t.before, w.currency)} → ${money(C.balanceAfter(t), w.currency)}</div>
+              </span>
+              <span class="tx-amount ${t.increase ? 'income' : ''}">${signedMoney(t.increase ? t.amount : -t.amount, w.currency)}</span>
+            </button>`;
+          })}</div>`
+        : html`<p class="empty">No corrections yet.</p>`}
+      <button class="btn" data-a="openReconcile">Correct balances</button>
+    </div>`;
+}
+
+function sheetCorrection(s) {
+  const t = state.tx.find((x) => x.id === s.id);
+  const w = wallet(t.walletId);
+  return html`${sheetHead('Balance correction', s.fromHistory ? 'openCorrections' : 'closeSheet', s.fromHistory ? 'Back' : 'Cancel', 'saveCorrection')}
+    <div class="sheet-body">
+      <div class="card">
+        <span class="budget-name">${badge(w, 'badge-small')} ${w.name}</span>
+        ${heroAmount(signedMoney(t.increase ? t.amount : -t.amount, w.currency))}
+        <p class="small">The app showed ${money(t.before, w.currency)}, corrected to ${money(C.balanceAfter(t), w.currency)}.</p>
+      </div>
+      ${s.error && html`<p class="error">${s.error}</p>`}
+      <label class="field"><span>Date</span><input id="f-date" class="input" type="date" value="${s.date}"></label>
+      <label class="field"><span>Note (optional)</span><input id="f-note" class="input" maxlength="120" value="${s.note}"></label>
+      <button class="btn btn-danger" data-a="deleteCorrection">Undo this correction</button>
+      <p class="small">Undoing removes it from the history and changes the balance of ${w.name} back by this amount.</p>
+    </div>`;
+}
+
 const FREQ_LABEL = {
   weekly: 'Weekly',
   biweekly: 'Every 2 weeks',
@@ -840,6 +956,7 @@ function sheetImport(s) {
     result.skipped && `${result.skipped} with no valid date or amount`,
     result.mismatched && `${result.mismatched} in a different currency from their wallet`,
     result.transfers && `${result.transfers} ${result.transfers === 1 ? 'transfer' : 'transfers'}`,
+    result.corrections && `${result.corrections} balance ${result.corrections === 1 ? 'correction' : 'corrections'}`,
   ].filter(Boolean);
   return html`${sheetHead('Import CSV', 'closeSheet', 'Cancel', ready && 'confirmImport', 'Import')}
     <div class="sheet-body">
@@ -885,6 +1002,9 @@ const SHEETS = {
   wallets: sheetWallets,
   wallet: sheetWallet,
   rates: sheetRates,
+  reconcile: sheetReconcile,
+  corrections: sheetCorrections,
+  correction: sheetCorrection,
   recurring: sheetRecurring,
   rule: sheetRule,
   import: sheetImport,
@@ -1360,6 +1480,67 @@ const actions = {
     toast('Wallet deleted.', before);
   },
 
+  // Balance corrections
+  openReconcile({ wallet: walletId }) {
+    openSheet({ type: 'reconcile', walletId, values: {}, date: today(), note: '' });
+    if (walletId) document.querySelector('[data-reconcile]').focus();
+  },
+  saveReconcile() {
+    const s = ui.sheet;
+    s.date = $('f-date').value;
+    s.note = $('f-note').value;
+    const actuals = {};
+    s.error = null;
+    for (const [id, text] of Object.entries(s.values)) {
+      if (!text.trim()) continue;
+      const actual = C.parseAmount(text);
+      if (actual === null) s.error = `Check the amount for ${wallet(id).name}.`;
+      else actuals[id] = actual;
+    }
+    if (!s.error && !s.date) s.error = 'Pick a date.';
+    const before = snapshot();
+    const added = s.error ? [] : C.correctBalances(state, actuals, s.date, s.note.trim());
+    if (!s.error && !added.length) s.error = 'Type a real balance that differs from the app.';
+    if (s.error) {
+      render();
+      return;
+    }
+    save();
+    ui.sheet = null;
+    render();
+    toast(`Corrected ${added.length} ${added.length === 1 ? 'wallet' : 'wallets'}.`, before);
+  },
+  openCorrections() {
+    openSheet({ type: 'corrections' });
+  },
+  editCorrection({ id, history }) {
+    const t = state.tx.find((x) => x.id === id);
+    openSheet({ type: 'correction', id, fromHistory: Boolean(history), date: t.date, note: t.note || '' });
+  },
+  saveCorrection() {
+    const s = ui.sheet;
+    const date = $('f-date').value;
+    if (!date) {
+      s.note = $('f-note').value;
+      s.error = 'Pick a date.';
+      render();
+      return;
+    }
+    Object.assign(state.tx.find((t) => t.id === s.id), { date, note: $('f-note').value.trim() });
+    save();
+    if (s.fromHistory) openSheet({ type: 'corrections' });
+    else actions.closeSheet();
+  },
+  deleteCorrection() {
+    const s = ui.sheet;
+    const before = snapshot();
+    state.tx = state.tx.filter((t) => t.id !== s.id);
+    save();
+    if (s.fromHistory) openSheet({ type: 'corrections' });
+    else actions.closeSheet();
+    toast('Correction undone.', before);
+  },
+
   // Exchange rates
   openRates() {
     openSheet({ type: 'rates' });
@@ -1543,6 +1724,14 @@ document.addEventListener('change', (e) => {
 });
 
 document.addEventListener('input', (e) => {
+  const reconcileId = e.target.dataset?.reconcile;
+  if (reconcileId) {
+    ui.sheet.values[reconcileId] = e.target.value;
+    document.querySelector(`[data-diff="${reconcileId}"]`).textContent =
+      reconcileDifference(wallet(reconcileId), C.balances(state).get(reconcileId), e.target.value);
+    $('reconcile-summary').textContent = reconcileSummary(ui.sheet);
+    return;
+  }
   const form = ui.sheet?.form;
   if (form && e.target.id === 'f-to-amount') form.toEdited = true;
   if (form && e.target.id === 'f-amount' && $('f-to-amount')) {

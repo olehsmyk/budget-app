@@ -226,6 +226,22 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   font-weight: 600;
 }
 .wallet-list { margin: 0 -16px; }
+.btn-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.reconcile-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+}
+.reconcile-row:first-child { border-top: 0; }
+.reconcile-main { flex: 1; min-width: 0; display: grid; gap: 1px; }
+.reconcile-main .tx-sub { white-space: normal; }
+.reconcile-input { flex: none; width: 38%; }
+.reconcile-input .input { text-align: right; padding-inline: 8px; }
+.reconcile-diff { font-size: 13px; font-weight: 600; color: var(--accent-ink); }
+.reconcile-diff:empty { display: none; }
+.reconcile-summary { font-size: 14px; font-weight: 500; color: var(--ink-2); }
 .amount-currency { text-align: center; font-size: 15px; font-weight: 600; color: var(--muted); }
 .missing-rate {
   width: 100%;
@@ -269,6 +285,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .tx-title, .tx-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tx-title { font-weight: 500; }
 .tx-sub { font-size: 13px; color: var(--muted); }
+.tx-wrap .tx-sub { white-space: normal; }
 .tx-amount { flex: none; max-width: 55%; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
 .tx-amount.income { color: var(--good); }
 

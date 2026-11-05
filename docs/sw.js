@@ -1,5 +1,5 @@
 // Bump CACHE whenever any file below changes, so phones pick up the new version.
-const CACHE = 'budget-v5';
+const CACHE = 'budget-v6';
 const FILES = [
   './',
   'index.html',

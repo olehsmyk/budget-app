@@ -574,3 +574,81 @@ test('imported wallets list the busiest first and hidden ones last', () => {
 test('wallet presets use real icons and colors', () => {
   for (const [name, , color] of C.WALLET_PRESETS) assert.ok(C.COLOR_KEYS.includes(color), name);
 });
+
+test('a correction brings a wallet to the real balance and keeps every old entry', () => {
+  const state = multiCurrencyState();
+  state.tx.push({ id: 't', date: '2020-01-01', type: 'expense', amount: 2500, walletId: 'eur', categoryId: 'c0', note: 'old' });
+  const old = JSON.stringify(state.tx);
+
+  const added = C.correctBalances(state, { eur: 90000, usd: 60000 }, '2026-11-06', 'Counted my cash');
+
+  assert.equal(JSON.stringify(state.tx.slice(0, 1)), JSON.stringify(JSON.parse(old)));
+  assert.equal(C.balances(state).get('eur'), 90000);
+  assert.equal(C.balances(state).get('usd'), 60000);
+  assert.deepEqual(added.map((t) => [t.walletId, t.increase, t.amount, t.before, C.balanceAfter(t), t.date, t.note]), [
+    ['eur', false, 7500, 97500, 90000, '2026-11-06', 'Counted my cash'],
+    ['usd', true, 10000, 50000, 60000, '2026-11-06', 'Counted my cash'],
+  ]);
+});
+
+test('a wallet already at the right balance gets no correction', () => {
+  const state = multiCurrencyState();
+  assert.deepEqual(C.correctBalances(state, { eur: 100000 }, '2026-11-06', ''), []);
+  assert.equal(state.tx.length, 0);
+});
+
+test('a wallet can be corrected to zero or below', () => {
+  const state = multiCurrencyState();
+  C.correctBalances(state, { eur: 0, usd: -500 }, '2026-11-06', '');
+  assert.equal(C.balances(state).get('eur'), 0);
+  assert.equal(C.balances(state).get('usd'), -500);
+});
+
+test('corrections change totals but never count as income or spending', () => {
+  const state = multiCurrencyState();
+  const before = C.netWorth(state).total;
+  C.correctBalances(state, { eur: 110000, usd: 40000 }, '2026-11-06', '');
+  const s = C.summarize(state, state.tx);
+  assert.deepEqual([s.income, s.expense, s.byCategory.size], [0, 0, 0]);
+  assert.equal(C.trend(state, '2026-11', 1)[0].expense, 0);
+  assert.equal(C.netWorth(state).total, before + 10000 - 9000);
+});
+
+test('deleting a correction puts the balance back', () => {
+  const state = multiCurrencyState();
+  const [added] = C.correctBalances(state, { eur: 1 }, '2026-11-06', '');
+  state.tx = state.tx.filter((t) => t.id !== added.id);
+  assert.equal(C.balances(state).get('eur'), 100000);
+});
+
+test('a correction keeps the balance seen at the time, even if older entries are added later', () => {
+  const state = multiCurrencyState();
+  const [added] = C.correctBalances(state, { eur: 90000 }, '2026-11-06', '');
+  state.tx.push({ id: 'late', date: '2026-01-01', type: 'expense', amount: 1000, walletId: 'eur', categoryId: 'c0', note: '' });
+  assert.equal(added.before, 100000);
+  assert.equal(C.balanceAfter(added), 90000);
+  assert.equal(C.balances(state).get('eur'), 89000);
+});
+
+test('corrections survive a backup and bad ones are rejected', () => {
+  const state = multiCurrencyState();
+  const [added] = C.correctBalances(state, { eur: 90000 }, '2026-11-06', 'n');
+  const copy = C.validateBackup(JSON.parse(JSON.stringify(state)));
+  assert.deepEqual(copy.tx.at(-1), added);
+  assert.equal(C.balances(copy).get('eur'), 90000);
+  assert.throws(() => C.validateBackup({ ...state, tx: [{ ...added, increase: 'yes' }] }));
+  assert.throws(() => C.validateBackup({ ...state, tx: [{ id: 'x', date: '2026-11-06', type: 'adjustment', amount: 5, increase: true, walletId: 'eur' }] }));
+});
+
+test('CSV export shows corrections signed, and importing that file skips and reports them', () => {
+  const state = multiCurrencyState();
+  C.correctBalances(state, { eur: 90000, usd: 60000 }, '2026-11-06', 'n');
+  const csv = C.toCSV(state);
+  assert.match(csv, /2026-11-06,adjustment,Main,-100\.00,EUR/);
+  assert.match(csv, /2026-11-06,adjustment,Car,100\.00,USD/);
+
+  const [headers, ...rows] = C.parseCSV(csv);
+  const out = C.buildImport(rows, C.guessMapping(headers), 'ymd', state.categories, state.wallets, 'eur');
+  assert.equal(out.tx.length, 0);
+  assert.equal(out.corrections, 2);
+});

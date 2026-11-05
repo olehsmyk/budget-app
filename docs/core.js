@@ -193,6 +193,8 @@ export function validateBackup(input) {
     if (!t.id || !isDate(t.date) || !isAmount(t.amount) || !walletIds.has(t.walletId)) fail('bad transaction');
     if (t.type === 'transfer') {
       if (!walletIds.has(t.toWalletId) || !isAmount(t.toAmount)) fail('bad transfer');
+    } else if (t.type === 'adjustment') {
+      if (typeof t.increase !== 'boolean' || !Number.isSafeInteger(t.before)) fail('bad balance correction');
     } else if (!isType(t.type) || !ids.has(t.categoryId)) {
       fail('bad transaction');
     }
@@ -374,12 +376,13 @@ export const sortTx = (list) =>
 
 export const txInMonth = (txs, key) => txs.filter((t) => monthOf(t.date) === key);
 
-// Income and spending in the display currency. Transfers only move money, so they count as neither.
+// Income and spending in the display currency. Transfers only move money and corrections only fix
+// the record, so neither counts as income or spending.
 export function summarize(state, txs) {
   const currencies = new Map(state.wallets.map((w) => [w.id, w.currency]));
   const out = { income: 0, expense: 0, byCategory: new Map(), missing: new Set(), converted: false };
   for (const t of txs) {
-    if (t.type === 'transfer') continue;
+    if (t.type === 'transfer' || t.type === 'adjustment') continue;
     const from = currencies.get(t.walletId);
     const value = convert(state, t.amount, from);
     if (value === null) {
@@ -411,12 +414,40 @@ export function balances(state) {
     if (t.type === 'transfer') {
       add(t.walletId, -t.amount);
       add(t.toWalletId, t.toAmount);
+    } else if (t.type === 'adjustment') {
+      add(t.walletId, t.increase ? t.amount : -t.amount);
     } else {
       add(t.walletId, t.type === 'income' ? t.amount : -t.amount);
     }
   }
   return out;
 }
+
+// Records the difference between each wallet's calculated balance and what's really there.
+// `actuals` maps wallet id to real balance. Past entries are never changed, and `before` keeps what
+// the app showed at that moment, so the history stays readable even if older entries change later.
+export function correctBalances(state, actuals, date, note) {
+  const bal = balances(state);
+  const added = [];
+  for (const [walletId, actual] of Object.entries(actuals)) {
+    const before = bal.get(walletId);
+    if (actual === before) continue;
+    added.push({
+      id: uid(),
+      date,
+      type: 'adjustment',
+      amount: Math.abs(actual - before),
+      increase: actual > before,
+      before,
+      walletId,
+      note,
+    });
+  }
+  state.tx.push(...added);
+  return added;
+}
+
+export const balanceAfter = (t) => t.before + (t.increase ? t.amount : -t.amount);
 
 // The sum of all visible wallets in the display currency.
 export function netWorth(state) {
@@ -465,7 +496,7 @@ export function toCSV(state) {
       t.date,
       t.type,
       guardFormula(from.name),
-      (t.amount / 100).toFixed(2),
+      ((t.type === 'adjustment' && !t.increase ? -t.amount : t.amount) / 100).toFixed(2),
       from.currency,
       guardFormula(names.get(t.categoryId) || ''),
       guardFormula(t.note || ''),
@@ -568,6 +599,7 @@ export function detectDateFormats(values) {
 const INCOME_WORDS = /inc|credit|earn|revenue|salary|deposit|дох/i;
 const EXPENSE_WORDS = /exp|debit|spend|cost|payment|витр/i;
 const TRANSFER_WORDS = /transfer|переказ/i;
+const CORRECTION_WORDS = /adjust|correction|reconcil/i;
 
 // Names from other apps, mapped onto this app's English categories. Keys are lower case.
 const CATEGORY_NAMES = new Map(Object.entries({
@@ -722,6 +754,7 @@ export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId
   const transferIns = [];
   let skipped = 0;
   let transfers = 0;
+  let corrections = 0;
   let mismatched = 0;
   const cell = (row, field) => (map[field] >= 0 ? String(row[map[field]] ?? '').trim() : '');
   const decimalMark = detectDecimalMark(rows.map((r) => cell(r, 'amount')));
@@ -752,6 +785,11 @@ export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId
     // A transfer row with no way to find its other half is reported rather than guessed at.
     if (!isPairedTransfer && TRANSFER_WORDS.test(typeCell)) {
       transfers++;
+      continue;
+    }
+    // A correction is only right against the balance it was made for, so it isn't replayed.
+    if (CORRECTION_WORDS.test(typeCell)) {
+      corrections++;
       continue;
     }
 
@@ -844,6 +882,7 @@ export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId
     openings,
     skipped,
     transfers,
+    corrections,
     mismatched,
     transfersMatched: pairs.length,
     transfersToClosed: unpairedOut.length + unpairedIn.length,
