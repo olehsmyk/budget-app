@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Budget</title>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Budget">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f9f9f7">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0d0d0d">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main id="view"></main>
+  <nav id="tabs" aria-label="Main"></nav>
+  <div id="sheet" role="dialog" aria-modal="true" hidden></div>
+  <div id="toast" role="status" hidden></div>
+  <input id="import-csv" class="file-input" type="file" accept=".csv,.txt,text/csv,text/plain" aria-label="Import CSV file">
+  <input id="restore-json" class="file-input" type="file" accept=".json,application/json" aria-label="Restore backup file">
+  <script type="module" src="app.js"></script>
+</body>
+</html>
