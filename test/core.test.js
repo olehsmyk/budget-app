@@ -805,3 +805,72 @@ test('planned entries total up, and only future months count them in the trend',
     ['2026-12', 2300, true],
   ]);
 });
+
+test('an entry dated later does not change balances or the total until its date', () => {
+  const state = multiCurrencyState();
+  state.tx.push(
+    { id: 'a', date: '2026-11-20', type: 'expense', amount: 1000, walletId: 'eur', categoryId: 'c' },
+    { id: 'b', date: '2026-11-20', type: 'transfer', amount: 2000, walletId: 'eur', toWalletId: 'usd', toAmount: 2200 },
+  );
+  const before = C.balances(state, '2026-11-19');
+  assert.equal(before.get('eur'), 100000);
+  assert.equal(before.get('usd'), 50000);
+  assert.equal(C.netWorth(state, '2026-11-19').total, C.netWorth({ ...state, tx: [] }).total);
+  const on = C.balances(state, '2026-11-20');
+  assert.equal(on.get('eur'), 97000);
+  assert.equal(on.get('usd'), 52200);
+});
+
+test('a correction uses today\'s balance, and a later entry still counts when its date arrives', () => {
+  const state = multiCurrencyState();
+  state.tx.push({ id: 'a', date: '2026-11-20', type: 'expense', amount: 1000, walletId: 'eur', categoryId: 'c' });
+  const [added] = C.correctBalances(state, { eur: 90000 }, '2026-11-06', '', '2026-11-06');
+  assert.equal(added.before, 100000);
+  assert.equal(added.amount, 10000);
+  assert.equal(C.balances(state, '2026-11-06').get('eur'), 90000);
+  assert.equal(C.balances(state, '2026-11-20').get('eur'), 89000);
+});
+
+const IMPORT_MAP = { date: 0, type: 1, amount: 2, category: 3, note: 4, wallet: -1, currency: -1 };
+
+function importRows(state, rows) {
+  const built = C.buildImport(rows, IMPORT_MAP, 'ymd', state.categories, state.wallets, 'eur');
+  return { built, repeats: C.findRepeats(state, built) };
+}
+
+test('importing the same file twice finds every entry already there', () => {
+  const state = multiCurrencyState();
+  const rows = [['2026-10-01', 'expense', '12.50', 'Coffee', 'Flat white'], ['2026-10-02', 'income', '100', 'Salary', '']];
+  const first = importRows(state, rows);
+  assert.equal(first.repeats.entries.size, 0);
+  state.categories.push(...first.built.newCategories);
+  state.tx.push(...first.built.tx);
+  const second = importRows(state, rows);
+  assert.equal(second.built.tx.length, 2);
+  assert.equal(second.repeats.entries.size, 2);
+});
+
+test('only the new rows of a longer file count as new', () => {
+  const state = multiCurrencyState();
+  const first = importRows(state, [['2026-10-01', 'expense', '12.50', 'Coffee', '']]);
+  state.categories.push(...first.built.newCategories);
+  state.tx.push(...first.built.tx);
+  const second = importRows(state, [['2026-10-01', 'expense', '12.50', 'Coffee', ''], ['2026-10-03', 'expense', '9', 'Coffee', '']]);
+  assert.equal(second.repeats.entries.size, 1);
+  assert.equal(second.built.tx.filter((t) => !second.repeats.entries.has(t.id))[0].date, '2026-10-03');
+});
+
+test('two identical entries in a file are not both repeats of one entry in the app', () => {
+  const state = multiCurrencyState();
+  const coffee = ['2026-10-01', 'expense', '3', 'Coffee', ''];
+  const first = importRows(state, [coffee]);
+  state.categories.push(...first.built.newCategories);
+  state.tx.push(...first.built.tx);
+  assert.equal(importRows(state, [coffee, coffee]).repeats.entries.size, 1);
+});
+
+test('a starting balance is a repeat only when the wallet already has that amount', () => {
+  const state = multiCurrencyState();
+  const built = { tx: [], openings: new Map([['eur', 100000], ['usd', 1]]) };
+  assert.deepEqual([...C.findRepeats(state, built).openings], ['eur']);
+});

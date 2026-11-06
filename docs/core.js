@@ -456,11 +456,13 @@ export function trend(state, endKey, months, today = null) {
   return rows;
 }
 
-// Each wallet's balance in its own currency.
-export function balances(state) {
+// Each wallet's balance in its own currency. With `today`, an entry dated later doesn't count until
+// its date arrives.
+export function balances(state, today = null) {
   const out = new Map(state.wallets.map((w) => [w.id, w.opening]));
   const add = (id, cents) => out.set(id, out.get(id) + cents);
   for (const t of state.tx) {
+    if (today && t.date > today) continue;
     if (t.type === 'transfer') {
       add(t.walletId, -t.amount);
       add(t.toWalletId, t.toAmount);
@@ -476,8 +478,8 @@ export function balances(state) {
 // Records the difference between each wallet's calculated balance and what's really there.
 // `actuals` maps wallet id to real balance. Past entries are never changed, and `before` keeps what
 // the app showed at that moment, so the history stays readable even if older entries change later.
-export function correctBalances(state, actuals, date, note) {
-  const bal = balances(state);
+export function correctBalances(state, actuals, date, note, today = null) {
+  const bal = balances(state, today);
   const added = [];
   for (const [walletId, actual] of Object.entries(actuals)) {
     const before = bal.get(walletId);
@@ -500,8 +502,8 @@ export function correctBalances(state, actuals, date, note) {
 export const balanceAfter = (t) => t.before + (t.increase ? t.amount : -t.amount);
 
 // The sum of all visible wallets in the display currency.
-export function netWorth(state) {
-  const bal = balances(state);
+export function netWorth(state, today = null) {
+  const bal = balances(state, today);
   const out = { total: 0, missing: new Set(), converted: false };
   for (const w of state.wallets) {
     if (w.archived) continue;
@@ -939,4 +941,25 @@ export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId
     transfersMatched: pairs.length,
     transfersToClosed: unpairedOut.length + unpairedIn.length,
   };
+}
+
+// What a built import would repeat. Each existing entry can only match one imported entry, so two
+// real, identical coffees on one day aren't mistaken for a repeat of a single one in the app.
+// A starting balance is a repeat when the wallet already has exactly that amount.
+export function findRepeats(state, built) {
+  const key = (t) => [t.date, t.type, t.amount, t.walletId, t.toWalletId, t.toAmount, t.categoryId, t.note].join('|');
+  const counts = new Map();
+  for (const t of state.tx) counts.set(key(t), (counts.get(key(t)) || 0) + 1);
+  const entries = new Set();
+  for (const t of built.tx) {
+    const left = counts.get(key(t)) || 0;
+    if (!left) continue;
+    counts.set(key(t), left - 1);
+    entries.add(t.id);
+  }
+  const openings = new Set();
+  for (const [id, cents] of built.openings) {
+    if (state.wallets.find((w) => w.id === id)?.opening === cents) openings.add(id);
+  }
+  return { entries, openings };
 }

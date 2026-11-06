@@ -77,8 +77,14 @@ function categoriesByUse(kind) {
   // sort keeps the list order for ties, so a new install shows the everyday categories first.
   return activeCategories(kind).sort((a, b) => (uses.get(b.id) || 0) - (uses.get(a.id) || 0));
 }
+// The categories for a form, plus the one already chosen even if that category is now hidden.
+const categoryChoices = (kind, selectedId) => {
+  const selected = category(selectedId);
+  return selected?.archived && selected.kind === kind ? [...activeCategories(kind), selected] : activeCategories(kind);
+};
+const balancesNow = () => C.balances(state, today());
 const wallet = (id) => state.wallets.find((w) => w.id === id);
-const activeWallets = () => state.wallets.filter((w) => !w.archived);
+const activeWallets =() => state.wallets.filter((w) => !w.archived);
 const otherWallet = (id) => activeWallets().find((w) => w.id !== id)?.id ?? null;
 const defaultWalletId = () => (wallet(state.lastWalletId)?.archived === false ? state.lastWalletId : activeWallets()[0].id);
 const walletInUse = (id) =>
@@ -340,8 +346,8 @@ function banners() {
 }
 
 function walletsCard() {
-  const worth = C.netWorth(state);
-  const bal = C.balances(state);
+  const worth = C.netWorth(state, today());
+  const bal = balancesNow();
   const withMoney = activeWallets().filter((w) => bal.get(w.id) !== 0);
   const shown = ui.showEmptyWallets || !withMoney.length ? activeWallets() : withMoney;
   const emptyCount = activeWallets().length - withMoney.length;
@@ -491,7 +497,7 @@ function viewActivity() {
         <span class="budget-name">${badge(w, 'badge-small')} ${w.name}</span>
         <button class="link" data-a="editWallet" data-id="${w.id}">Edit</button>
       </div>
-      ${heroAmount(money(C.balances(state).get(w.id), w.currency))}
+      ${heroAmount(money(balancesNow().get(w.id), w.currency))}
       <button class="btn" data-a="openReconcile" data-wallet="${w.id}">Correct balance</button>
     </section>`}
     ${!ui.search.trim() && monthNav()}
@@ -828,7 +834,7 @@ function sheetCategory(s) {
 }
 
 function sheetWallets() {
-  const bal = C.balances(state);
+  const bal = balancesNow();
   const sorted = [...activeWallets(), ...state.wallets.filter((w) => w.archived)];
   return html`${sheetHead('Wallets', 'Back')}
     <div class="sheet-body">
@@ -905,7 +911,7 @@ function reconcileDifference(w, balance, text) {
 }
 
 function reconcileSummary(s) {
-  const bal = C.balances(state);
+  const bal = balancesNow();
   let count = 0;
   let total = 0;
   let converted = false;
@@ -922,7 +928,7 @@ function reconcileSummary(s) {
 }
 
 function sheetReconcile(s) {
-  const bal = C.balances(state);
+  const bal = balancesNow();
   const wallets = s.walletId ? [wallet(s.walletId)] : activeWallets();
   return html`${sheetHead(s.walletId ? 'Correct balance' : 'Correct balances', 'Cancel', 'saveReconcile')}
     <div class="sheet-body">
@@ -1049,7 +1055,7 @@ function sheetRule(s) {
               ? `Each payment uses the rate on its due date. Today: 1 ${f.foreign} = ${formatRate(currentRate)} ${walletCurrency}.`
               : `No exchange rate saved for ${f.foreign}. Connect to the internet, or choose My rate.`}</p>`}`}
       <label class="field"><span>Category</span>
-        <select id="f-cat" class="input">${activeCategories(f.type).map(
+        <select id="f-cat" class="input">${categoryChoices(f.type, f.categoryId).map(
           (c) => html`<option value="${c.id}" ${c.id === f.categoryId ? 'selected' : ''}>${c.name}</option>`,
         )}</select>
       </label>
@@ -1070,6 +1076,18 @@ function sheetRule(s) {
 
 const DATE_FORMATS = { ymd: 'Year-Month-Day', dmy: 'Day-Month-Year', mdy: 'Month-Day-Year' };
 
+// What an import would add, after the choice about anything already in the app.
+function importPlan(s) {
+  const result = C.buildImport(s.rows, s.map, s.fmt, state.categories, state.wallets, s.walletId);
+  const repeats = C.findRepeats(state, result);
+  return {
+    result,
+    repeats,
+    tx: s.keepRepeats ? result.tx : result.tx.filter((t) => !repeats.entries.has(t.id)),
+    openings: [...result.openings].filter(([id]) => s.keepRepeats || !repeats.openings.has(id)),
+  };
+}
+
 function sheetImport(s) {
   const fields = [
     ['date', 'Date'],
@@ -1080,9 +1098,10 @@ function sheetImport(s) {
     ['currency', 'Currency'],
     ['note', 'Note'],
   ];
-  const result = C.buildImport(s.rows, s.map, s.fmt, state.categories, state.wallets, s.walletId);
+  const { result, repeats, tx, openings } = importPlan(s);
+  const repeatCount = repeats.entries.size + repeats.openings.size;
   const fits = C.detectDateFormats(s.map.date >= 0 ? s.rows.map((r) => r[s.map.date]) : []);
-  const ready = s.map.date >= 0 && s.map.amount >= 0 && (result.tx.length > 0 || result.openings.size > 0);
+  const ready = s.map.date >= 0 && s.map.amount >= 0 && (tx.length > 0 || openings.length > 0);
   const allWallets = [...state.wallets, ...result.newWallets];
   const visibleNewWallets = result.newWallets.filter((w) => !w.archived);
   const allCategories = [...state.categories, ...result.newCategories];
@@ -1099,6 +1118,12 @@ function sheetImport(s) {
   return html`${sheetHead('Import CSV', 'Cancel', ready && 'confirmImport', 'Import')}
     <div class="sheet-body">
       <p class="small">Match your file's columns. ${s.rows.length} rows found.</p>
+      ${repeatCount > 0 && html`<div class="card">
+        <strong>${repeats.entries.size} of ${result.tx.length} entries are already in the app</strong>
+        ${repeats.openings.size > 0 && html`<p class="small">${repeats.openings.size} starting ${repeats.openings.size === 1 ? 'balance is' : 'balances are'} already set too.</p>`}
+        <p class="small">Importing them again would count them twice.</p>
+        ${seg('importRepeats', s.keepRepeats ? 'keep' : 'skip', [['skip', 'Skip them'], ['keep', 'Import anyway']])}
+      </div>`}
       <div class="card">
         ${walletSelect('f-import-wallet', 'Rows with no wallet go into', s.walletId, 'importWallet')}
         ${fields.map(
@@ -1117,13 +1142,13 @@ function sheetImport(s) {
         ${fits.length > 1 && html`<p class="small">These dates fit more than one format. Check the preview below.</p>`}
       </div>
       <div class="card">
-        <strong>${result.tx.length} entries ready</strong>
+        <strong>${tx.length || openings.length ? `${tx.length} entries ready` : 'Nothing new to import'}</strong>
         ${skips.length > 0 && html`<p class="small">Skipped: ${skips.join(', ')}.</p>`}
         ${transferNotes.length > 0 && html`<p class="small">Transfers: ${transferNotes.join(', ')}.</p>`}
-        ${result.openings.size > 0 && html`<p class="small">Starting balances set for ${result.openings.size} ${result.openings.size === 1 ? 'wallet' : 'wallets'}.</p>`}
+        ${openings.length > 0 && html`<p class="small">Starting balances set for ${openings.length} ${openings.length === 1 ? 'wallet' : 'wallets'}.</p>`}
         ${visibleNewWallets.length > 0 && html`<p class="small">New wallets: ${visibleNewWallets.map((w) => `${w.name} (${w.currency})`).join(', ')}</p>`}
         ${result.newCategories.length > 0 && html`<p class="small">New categories: ${result.newCategories.map((c) => c.name).join(', ')}</p>`}
-        <div class="preview">${result.tx.filter((t) => t.type !== 'transfer').slice(0, 4).map((t) => {
+        <div class="preview">${tx.filter((t) => t.type !== 'transfer').slice(0, 4).map((t) => {
           const name = allCategories.find((c) => c.id === t.categoryId).name;
           const w = allWallets.find((x) => x.id === t.walletId);
           return html`<div><span>${shortDate(t.date)} · ${name}${t.note ? ` · ${t.note}` : ''}</span>
@@ -1572,8 +1597,9 @@ const actions = {
     ui.month = C.monthOf(f.date);
     goBack();
     const shown = money(amount, wallet(f.walletId).currency);
-    if (s.id) toast('Entry updated.');
-    else toast(isTransfer ? `Moved ${shown} to ${to.name}.` : `Added ${shown}.`);
+    const later = f.date > today() ? ` Your balance changes on ${shortDate(f.date)}.` : '';
+    if (s.id) toast(`Entry updated.${later}`);
+    else toast(`${isTransfer ? `Moved ${shown} to ${to.name}.` : `Added ${shown}.`}${later}`);
   },
   deleteTx() {
     const before = snapshot();
@@ -1743,8 +1769,9 @@ const actions = {
       else actuals[id] = actual;
     }
     if (!s.error && !s.date) s.error = 'Pick a date.';
+    if (!s.error && s.date > today()) s.error = "A correction fixes today's balance, so it can't have a future date.";
     const before = snapshot();
-    const added = s.error ? [] : C.correctBalances(state, actuals, s.date, s.note.trim());
+    const added = s.error ? [] : C.correctBalances(state, actuals, s.date, s.note.trim(), today());
     if (!s.error && !added.length) s.error = 'Type a real balance that differs from the app.';
     if (s.error) {
       render();
@@ -1764,9 +1791,9 @@ const actions = {
   saveCorrection() {
     const s = ui.sheet;
     const date = $('f-date').value;
-    if (!date) {
+    if (!date || date > today()) {
       s.note = $('f-note').value;
-      s.error = 'Pick a date.';
+      s.error = date ? "A correction can't have a future date." : 'Pick a date.';
       render();
       return;
     }
@@ -1906,10 +1933,14 @@ const actions = {
     render();
     toast('Backup created.');
   },
+  importRepeats({ v }) {
+    ui.sheet.keepRepeats = v === 'keep';
+    render();
+  },
   confirmImport() {
     const s = ui.sheet;
     const before = snapshot();
-    const { tx, newCategories, newWallets, openings } = C.buildImport(s.rows, s.map, s.fmt, state.categories, state.wallets, s.walletId);
+    const { result: { newCategories, newWallets }, tx, openings } = importPlan(s);
     state.categories.push(...newCategories);
     state.wallets.push(...newWallets);
     state.tx.push(...tx);
@@ -2026,7 +2057,7 @@ document.addEventListener('input', (e) => {
   if (reconcileId) {
     ui.sheet.values[reconcileId] = e.target.value;
     document.querySelector(`[data-diff="${reconcileId}"]`).textContent =
-      reconcileDifference(wallet(reconcileId), C.balances(state).get(reconcileId), e.target.value);
+      reconcileDifference(wallet(reconcileId), balancesNow().get(reconcileId), e.target.value);
     $('reconcile-summary').textContent = reconcileSummary(ui.sheet);
     return;
   }
