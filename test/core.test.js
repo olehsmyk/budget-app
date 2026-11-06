@@ -1239,3 +1239,158 @@ test('a Monefy tax category imports as tax and fees as fees, and a second import
   assert.equal(C.findRepeats(state, second).entries.size, 2);
   assert.equal(second.newTaxTypes.length, 0);
 });
+
+// ---------- Rate history and yearly summary ----------
+
+const HISTORY = { start: '2026-01-01', rates: { USD: [40, 41, 42], EUR: [50, 51, 52], GBP: [null, 60, 61] } };
+
+test('rate history gives the official rate for a past date, and saved rates come first', (t) => {
+  C.setRateHistory(HISTORY);
+  t.after(() => C.setRateHistory(null));
+  const state = multiCurrencyState();
+  state.currency = 'UAH';
+  state.rates = { USD: 99, EUR: 99 };
+  assert.deepEqual(C.rateOn(state, 'USD', 'UAH', '2026-01-02'), { rate: 41, source: 'nbu' });
+  assert.equal(C.rateOn(state, 'EUR', 'USD', '2026-01-03').rate, 52 / 42);
+  state.nbu['2026-01-02'] = { USD: 45 };
+  assert.equal(C.rateOn(state, 'USD', 'UAH', '2026-01-02').rate, 45);
+});
+
+test('outside the history, or for a currency not in it, today\'s rate is the estimate', (t) => {
+  C.setRateHistory(HISTORY);
+  t.after(() => C.setRateHistory(null));
+  const state = multiCurrencyState();
+  state.currency = 'UAH';
+  state.rates = { USD: 99, IDR: 0.002, GBP: 70 };
+  assert.deepEqual(C.rateOn(state, 'USD', 'UAH', '2026-02-01'), { rate: 99, source: 'estimate' });
+  assert.deepEqual(C.rateOn(state, 'USD', 'UAH', '2020-01-01'), { rate: 99, source: 'estimate' });
+  assert.equal(C.rateOn(state, 'IDR', 'UAH', '2026-01-02').source, 'estimate');
+  assert.equal(C.rateOn(state, 'GBP', 'UAH', '2026-01-01').source, 'estimate');
+});
+
+test('a past date covered by the history needs no download, and a tax on it is exact at once', (t) => {
+  C.setRateHistory(HISTORY);
+  t.after(() => C.setRateHistory(null));
+  const state = taxState();
+  state.taxTypes[0].currency = 'UAH';
+  const tax = C.addIncomeTax(state, income(state, 150000, '2026-01-02'), 'single', 5);
+  assert.equal(tax.fxSource, 'nbu');
+  assert.equal(tax.dueAmount, Math.round(150000 * 41 * 0.05));
+  C.needRate(state, '2026-01-03');
+  C.needRate(state, '2026-02-01');
+  assert.deepEqual(state.pendingRates, ['2026-02-01']);
+});
+
+test('total wealth keeps using today\'s rate while past months use their own', (t) => {
+  C.setRateHistory(HISTORY);
+  t.after(() => C.setRateHistory(null));
+  const state = multiCurrencyState();
+  state.currency = 'UAH';
+  state.rates = { USD: 50, EUR: 60 };
+  state.wallets = [{ ...state.wallets[1], opening: 0 }];
+  state.tx = [{ id: 'a', date: '2026-01-01', type: 'income', amount: 1000, walletId: 'usd', categoryId: 'c11', note: '' }];
+  assert.equal(C.summarize(state, state.tx).income, 40000);
+  assert.equal(C.netWorth(state).total, 50000);
+});
+
+test('a recurring entry in another currency asks for the rate on its date', () => {
+  const state = multiCurrencyState();
+  state.recurring = [{ id: 'r', type: 'expense', categoryId: 'c0', walletId: 'usd', amount: 100, freq: 'monthly', start: '2026-07-01', lastRun: null, note: '' }];
+  C.applyRecurring(state, '2026-07-01');
+  assert.deepEqual(state.pendingRates, ['2026-07-01']);
+});
+
+// Income of 1,000 in Feb and 2,000 in May, tax in Feb, a refund in May, and untaxed income in another wallet.
+function summaryState() {
+  const state = taxState();
+  state.currency = 'USD';
+  state.rates = { EUR: 1.1 };
+  state.categories.push({ id: 'ref', name: 'Tax refund', icon: 'tag', color: 'teal', kind: 'income', limit: null, archived: false });
+  const add = (date, amount, walletId, categoryId = 'c11') => {
+    const t = { id: C.uid(), date, type: 'income', amount, walletId, categoryId, note: '' };
+    state.tx.push(t);
+    return t;
+  };
+  const feb = add('2026-02-10', 100000, 'usd');
+  add('2026-05-10', 200000, 'usd');
+  add('2026-05-11', 1000, 'usd', 'ref');
+  add('2026-03-01', 50000, 'eur');
+  add('2025-12-31', 900000, 'usd');
+  const tax = C.addIncomeTax(state, feb, 'single', 5);
+  C.addTaxPayment(state, tax, { walletId: 'usd', amount: 3000, taxAmount: 3000, date: '2026-04-02' });
+  return state;
+}
+
+test('the yearly summary adds up by month, quarter and year', () => {
+  const sum = C.yearSummary(summaryState(), 2026, { walletIds: ['usd'] });
+  assert.deepEqual(sum.quarters.map((q) => q.income), [100000, 200000, 0, 0]);
+  assert.equal(sum.total.income, 300000);
+  for (const field of ['income', 'tax', 'taxPaid', 'taxUnpaid', 'refund', 'afterTax']) {
+    assert.equal(sum.quarters.reduce((n, q) => n + q[field], 0), sum.total[field]);
+    assert.equal(sum.months.reduce((n, m) => n + m[field], 0), sum.total[field]);
+  }
+});
+
+test('tax in the summary counts for its income month, split into paid and still to pay', () => {
+  const sum = C.yearSummary(summaryState(), 2026, { walletIds: ['usd'] });
+  assert.equal(sum.quarters[0].tax, 5000);
+  assert.equal(sum.quarters[0].taxPaid, 3000);
+  assert.equal(sum.quarters[0].taxUnpaid, 2000);
+  assert.equal(sum.quarters[1].tax, 0);
+  assert.equal(sum.total.byType.get('single'), 5000);
+});
+
+test('refunds stay out of income but count in what is kept', () => {
+  const sum = C.yearSummary(summaryState(), 2026, { walletIds: ['usd'] });
+  assert.equal(sum.total.refund, 1000);
+  assert.equal(sum.total.income, 300000);
+  assert.equal(sum.total.afterTax, 300000 + 1000 - 5000);
+});
+
+test('the summary can count one set of wallets or all of them, and only that year', () => {
+  const all = C.yearSummary(summaryState(), 2026).total.income;
+  assert.equal(all, 300000 + Math.round(50000 * 1.1));
+  assert.equal(C.yearSummary(summaryState(), 2025).total.income, 900000);
+  assert.equal(C.yearSummary(summaryState(), 2025).total.tax, 0);
+});
+
+test('the summary converts at each date\'s rate into the chosen currency', (t) => {
+  C.setRateHistory({ start: '2026-02-01', rates: { USD: new Array(100).fill(40), EUR: new Array(100).fill(50) } });
+  t.after(() => C.setRateHistory(null));
+  const sum = C.yearSummary(summaryState(), 2026, { currency: 'UAH', walletIds: ['usd'] });
+  assert.equal(sum.currency, 'UAH');
+  assert.equal(sum.quarters[0].income, 100000 * 40);
+  assert.equal(sum.estimated, 0);
+  assert.equal(sum.quarters[1].income, 200000 * 40);
+});
+
+test('the summary says when an amount used today\'s rate or has no rate at all', () => {
+  const state = summaryState();
+  state.currency = 'USD';
+  const estimated = C.yearSummary(state, 2026);
+  assert.ok(estimated.estimated >= 1);
+  state.rates = {};
+  assert.deepEqual([...C.yearSummary(state, 2026).missing], ['EUR']);
+});
+
+test('the summary CSV matches the summary, with a column for each tax', () => {
+  const state = summaryState();
+  const sum = C.yearSummary(state, 2026, { walletIds: ['usd'] });
+  const rows = C.parseCSV(C.yearSummaryCSV(state, sum));
+  assert.deepEqual(rows[0], ['period', 'currency', 'income', 'Single tax', 'tax_total', 'tax_paid', 'tax_to_pay', 'tax_refunds', 'after_tax']);
+  assert.deepEqual(rows[1], ['2026 Q1', 'USD', '1000.00', '50.00', '50.00', '30.00', '20.00', '0.00', '950.00']);
+  assert.deepEqual(rows[5], ['2026', 'USD', '3000.00', '50.00', '50.00', '30.00', '20.00', '10.00', '2960.00']);
+  assert.equal(rows.length, 6);
+});
+
+test('a tax name cannot turn into a spreadsheet formula in the summary', () => {
+  const state = summaryState();
+  state.taxTypes[0].name = '=SUM(A1)';
+  const sum = C.yearSummary(state, 2026);
+  assert.ok(!C.yearSummaryCSV(state, sum).split('\r\n')[0].includes(',=SUM'));
+});
+
+test('the first year with data limits how far back a summary goes', () => {
+  assert.equal(C.firstDataYear(summaryState(), '2026'), '2025');
+  assert.equal(C.firstDataYear(C.defaultState('2026-01-01'), '2026'), '2026');
+});

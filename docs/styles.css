@@ -603,6 +603,8 @@ details summary { color: var(--accent-ink); font-size: 14px; font-weight: 500; m
   font-weight: 600;
 }
 .btn-links { display: flex; gap: 16px; }
+.value-text { font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.table caption { text-align: left; }
 .tax-figure { font-size: 22px; font-weight: 700; margin-top: -8px; overflow-wrap: anywhere; }
 .tax-figure .small { font-weight: 400; }
 .tax-diff { font-size: 14px; font-weight: 500; color: var(--ink-2); }

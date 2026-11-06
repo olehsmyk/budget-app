@@ -372,20 +372,34 @@ export function parseRate(input) {
   return s && Number.isFinite(n) && n > 0 ? n : null;
 }
 
+// Official past rates shipped with the app (see tools/make-rate-history.js). Kept out of the saved
+// data, so the rates don't fill up the phone's storage or every backup.
+let rateHistory = null;
+export function setRateHistory(history) {
+  rateHistory = history && { ...history, startMs: Date.UTC(...isoParts(history.start)) };
+}
+const isoParts = (iso) => {
+  const [y, m, d] = iso.split('-').map(Number);
+  return [y, m - 1, d];
+};
+const historyIndex = (date) => (Date.UTC(...isoParts(date)) - rateHistory.startMs) / 86400000;
+const historyRate = (code, date) => (rateHistory ? rateHistory.rates[code]?.[historyIndex(date)] : undefined);
+const historyCovers = (date) => historyRate('USD', date) !== undefined && historyRate('USD', date) !== null;
+
 // The official NBU rate on a date when there is one, otherwise today's rate as an estimate.
 // `source` says which, so anything estimated can be corrected once the real rate is known.
 export function rateOn(state, from, to, date) {
   if (from === to) return { rate: 1, source: 'nbu' };
   const table = state.nbu?.[date];
-  const inUah = (code) => (code === 'UAH' ? 1 : table?.[code]);
-  if (table && inUah(from) && inUah(to)) return { rate: inUah(from) / inUah(to), source: 'nbu' };
+  const inUah = (code) => (code === 'UAH' ? 1 : table?.[code] ?? historyRate(code, date));
+  if (inUah(from) && inUah(to)) return { rate: inUah(from) / inUah(to), source: 'nbu' };
   const rate = crossRate(state, from, to);
   return rate ? { rate, source: 'estimate' } : null;
 }
 
-// Into the display currency, at the saved rate for that date when there is one.
-export function convertOn(state, cents, from, date) {
-  const found = rateOn(state, from, state.currency, date);
+// Into another currency, the display one by default, at the saved rate for that date when there is one.
+export function convertOn(state, cents, from, date, to = state.currency) {
+  const found = rateOn(state, from, to, date);
   return found ? Math.round(cents * found.rate) : null;
 }
 
@@ -409,7 +423,7 @@ export function applyNbuRates(state, date, rows, codes) {
 }
 
 export function needRate(state, date) {
-  if (!state.nbu[date] && !state.pendingRates.includes(date)) state.pendingRates.push(date);
+  if (!state.nbu[date] && !state.pendingRates.includes(date) && !historyCovers(date)) state.pendingRates.push(date);
 }
 
 // `usdRates` is units of each currency per 1 USD, as the rates service returns them.
@@ -610,6 +624,7 @@ export function applyRecurring(state, today) {
           for (const type of linkedTaxTypes(state, rule.walletId)) addIncomeTax(state, entry, type.id, type.rate);
         }
       }
+      if (state.wallets.find((w) => w.id === rule.walletId).currency !== state.currency) needRate(state, date);
       rule.lastRun = date;
       added++;
     }
@@ -689,15 +704,17 @@ export const unpaidTaxes = (state) =>
   state.taxes.filter((x) => !taxStatus(state, x).settled).sort((a, b) => a.date.localeCompare(b.date));
 
 // Taxes belong to the month of their income or due date, whenever they get paid.
-export function monthTaxes(state, key) {
-  const out = { paid: 0, unpaid: 0, missing: new Set(), converted: false, byType: new Map() };
+export function monthTaxes(state, key, target = state.currency) {
+  const out = { paid: 0, unpaid: 0, missing: new Set(), converted: false, estimated: 0, byType: new Map() };
   const count = (field, cents, currency, date, typeId) => {
-    const value = convertOn(state, cents, currency, date);
-    if (value === null) {
+    const found = rateOn(state, currency, target, date);
+    if (!found) {
       out.missing.add(currency);
       return;
     }
-    if (currency !== state.currency) out.converted = true;
+    const value = Math.round(cents * found.rate);
+    if (currency !== target) out.converted = true;
+    if (found.source !== 'nbu') out.estimated++;
     out[field] += value;
     out.byType.set(typeId, (out.byType.get(typeId) || 0) + value);
   };
@@ -708,6 +725,59 @@ export function monthTaxes(state, key) {
     if (status.remaining) count('unpaid', status.remaining, tax.currency, tax.date, tax.taxTypeId);
   }
   return out;
+}
+
+const isRefundCategory = (c) => c?.kind === 'income' && c.name.toLowerCase() === 'tax refund';
+
+// One year of income and tax by month, quarter and in total, in one currency. `walletIds` limits the
+// income counted, so money that isn't taxed can stay out of it. Refunds are listed on their own.
+// Quarters and the year are added up from the months, so the numbers on screen always add up.
+export function yearSummary(state, year, { currency = state.currency, walletIds = null } = {}) {
+  const blank = (label) => ({ label, income: 0, tax: 0, taxPaid: 0, taxUnpaid: 0, refund: 0, afterTax: 0, byType: new Map() });
+  const months = Array.from({ length: 12 }, (_, i) => blank(`${year}-${pad(i + 1)}`));
+  const missing = new Set();
+  let estimated = 0;
+  const categories = new Map(state.categories.map((c) => [c.id, c]));
+  const currencies = new Map(state.wallets.map((w) => [w.id, w.currency]));
+  for (const t of state.tx) {
+    if (t.type !== 'income' || !t.date.startsWith(`${year}-`)) continue;
+    const refund = isRefundCategory(categories.get(t.categoryId));
+    if (!refund && walletIds && !walletIds.includes(t.walletId)) continue;
+    const from = currencies.get(t.walletId);
+    const found = rateOn(state, from, currency, t.date);
+    if (!found) {
+      missing.add(from);
+      continue;
+    }
+    if (found.source !== 'nbu') estimated++;
+    months[Number(t.date.slice(5, 7)) - 1][refund ? 'refund' : 'income'] += Math.round(t.amount * found.rate);
+  }
+  for (const m of months) {
+    const taxes = monthTaxes(state, m.label, currency);
+    m.taxPaid = taxes.paid;
+    m.taxUnpaid = taxes.unpaid;
+    m.tax = taxes.paid + taxes.unpaid;
+    m.byType = taxes.byType;
+    m.afterTax = m.income + m.refund - m.tax;
+    estimated += taxes.estimated;
+    taxes.missing.forEach((code) => missing.add(code));
+  }
+  const addUp = (label, rows) => {
+    const sum = blank(label);
+    for (const row of rows) {
+      for (const field of ['income', 'tax', 'taxPaid', 'taxUnpaid', 'refund', 'afterTax']) sum[field] += row[field];
+      for (const [id, value] of row.byType) sum.byType.set(id, (sum.byType.get(id) || 0) + value);
+    }
+    return sum;
+  };
+  const quarters = [0, 1, 2, 3].map((q) => addUp(`Q${q + 1}`, months.slice(q * 3, q * 3 + 3)));
+  return { year, currency, months, quarters, total: addUp(String(year), months), missing, estimated };
+}
+
+// The first year with anything in it, so a summary can't wander off to empty years.
+export function firstDataYear(state, fallback) {
+  const dates = [...state.tx.map((t) => t.date), ...state.taxes.map((x) => x.date)];
+  return dates.length ? dates.reduce((a, b) => (a < b ? a : b)).slice(0, 4) : fallback;
 }
 
 // Keeps an income's taxes in step after saving it. `choices` maps a tax type to its percentage, or
@@ -929,6 +999,28 @@ export function toCSV(state) {
       to ? to.currency : '',
       t.foreignCurrency ? (t.foreignAmount / 100).toFixed(2) : '',
       t.foreignCurrency || '',
+    ]);
+  }
+  return rows.map((r) => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
+}
+
+// A summary for filing: one row per quarter and one for the year, with a column for each tax.
+export function yearSummaryCSV(state, summary) {
+  const typeIds = [...summary.total.byType.keys()];
+  const name = (id) => state.taxTypes.find((x) => x.id === id).name;
+  const amount = (cents) => (cents / 100).toFixed(2);
+  const rows = [['period', 'currency', 'income', ...typeIds.map((id) => guardFormula(name(id))), 'tax_total', 'tax_paid', 'tax_to_pay', 'tax_refunds', 'after_tax']];
+  for (const row of [...summary.quarters.map((q) => ({ ...q, label: `${summary.year} ${q.label}` })), summary.total]) {
+    rows.push([
+      row.label,
+      summary.currency,
+      amount(row.income),
+      ...typeIds.map((id) => amount(row.byType.get(id) || 0)),
+      amount(row.tax),
+      amount(row.taxPaid),
+      amount(row.taxUnpaid),
+      amount(row.refund),
+      amount(row.afterTax),
     ]);
   }
   return rows.map((r) => r.map(csvCell).join(',')).join('\r\n') + '\r\n';

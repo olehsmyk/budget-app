@@ -1,5 +1,8 @@
 import * as C from './core.js';
 import { CATEGORY_ICONS } from './category-icons.js';
+import { NBU_HISTORY } from './nbu-history.js';
+
+C.setRateHistory(NBU_HISTORY);
 
 const KEY = 'budget.v1';
 const COMMON_CURRENCIES = ['USD', 'EUR', 'UAH', 'IDR', 'GBP', 'PLN', 'CZK', 'CHF', 'SEK', 'NOK', 'DKK', 'CAD', 'AUD', 'JPY'];
@@ -162,6 +165,9 @@ const moneyCompact = (cents) =>
   }).format(cents / 100);
 const moneyRounded = (cents) =>
   new Intl.NumberFormat(undefined, { style: 'currency', currency: state.currency, minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(cents / 100);
+// For tables that name their currency once, so the columns fit on a phone.
+const plainAmount = (cents) =>
+  `${cents < 0 ? '−' : ''}${new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Math.abs(cents) / 100)}`;
 const formatRate = (rate) => String(Number(rate.toPrecision(6)));
 const monthDate = (key) => C.fromISO(`${key}-01`);
 const monthLabel = (key) =>
@@ -221,6 +227,7 @@ const monthNav = () => {
   </div>`;
 };
 
+const signedPlain = (cents) => `${cents < 0 ? '−' : ''}${money(Math.abs(cents))}`;
 const signedMoney = (cents, currency) => `${cents > 0 ? '+' : cents < 0 ? '−' : ''}${money(Math.abs(cents), currency)}`;
 
 function correctionRow(t) {
@@ -761,13 +768,14 @@ function viewInsights() {
         <span>Lighter bars are unpaid or planned</span>
       </div>
       ${trendChart(rows)}
-      ${chosen && html`<p class="small">${monthLabel(chosen.key)}${chosen.planned ? ' (planned)' : ''}: income ${money(chosen.income)}, expenses ${money(chosen.expense)}, tax ${money(chosen.tax)}</p>`}
+      ${chosen && html`<p class="small">${monthLabel(chosen.key)}${chosen.planned ? ' (planned)' : ''}: income ${money(chosen.income)}, expenses ${money(chosen.expense)}, tax ${money(chosen.tax)}, income after tax ${signedPlain(chosen.income - chosen.tax)}</p>`}
       <details>
         <summary>Show as table</summary>
         <table class="table">
+          <caption class="small">In ${state.currency}</caption>
           <thead><tr><th>Month</th><th>Income</th><th>Expenses</th><th>Tax</th></tr></thead>
           <tbody>${rows.map(
-            (r) => html`<tr><td>${monthShort(r.key)}${r.planned ? ' (planned)' : ''}</td><td>${money(r.income)}</td><td>${money(r.expense)}</td><td>${money(r.tax)}</td></tr>`,
+            (r) => html`<tr><td>${monthShort(r.key)}${r.planned ? ' (planned)' : ''}</td><td>${plainAmount(r.income)}</td><td>${plainAmount(r.expense)}</td><td>${plainAmount(r.tax)}</td></tr>`,
           )}</tbody>
         </table>
       </details>
@@ -1047,11 +1055,83 @@ function sheetTaxes() {
       </section>
       ${unpaid.length > 1 && html`<button class="btn" data-a="payAll">Pay all</button>`}
       <button class="btn" data-a="newTaxEntry">Add a tax</button>
+      <button class="btn" data-a="openTaxSummary">Yearly summary</button>
       <button class="btn" data-a="openTaxTypes">Tax types</button>
       ${done.length > 0 && html`<section class="month-section">
         <h2 class="section-title">Paid</h2>
         ${taxesList(done, false)}
       </section>`}
+    </div>`;
+}
+
+const taxedWalletIds = () => [...new Set(activeTaxTypes().filter((x) => x.mode === 'percent').flatMap((x) => x.walletIds))];
+
+function currentSummary(s) {
+  return C.yearSummary(state, s.year, { currency: s.currency, walletIds: s.scope === 'taxed' ? taxedWalletIds() : null });
+}
+
+function summaryTable(title, rows) {
+  return html`<table class="table">
+    <thead><tr><th>${title}</th><th>Income</th><th>Tax</th><th>After tax</th></tr></thead>
+    <tbody>${rows.map(
+      (r) => html`<tr><td>${r.name}</td><td>${plainAmount(r.income)}</td><td>${plainAmount(r.tax)}</td><td>${plainAmount(r.afterTax)}</td></tr>`,
+    )}</tbody>
+  </table>`;
+}
+
+function sheetTaxSummary(s) {
+  const sum = currentSummary(s);
+  const t = sum.total;
+  const taxed = taxedWalletIds();
+  const first = Number(C.firstDataYear(state, today().slice(0, 4)));
+  const types = [...t.byType].map(([id, value]) => ({ type: taxType(id), value })).sort((a, b) => b.value - a.value);
+  const quarters = sum.quarters.map((q) => ({ ...q, name: q.label }));
+  const months = sum.months
+    .filter((m) => m.income || m.tax || m.refund)
+    .map((m) => ({ ...m, name: monthShort(m.label) }));
+  return html`${sheetHead('Yearly summary', 'Back')}
+    <div class="sheet-body">
+      <div class="month-nav">
+        <button class="icon-btn" data-a="summaryYear" data-v="${s.year - 1}" aria-label="Previous year" ${s.year <= first ? 'disabled' : ''}>${svg(ICONS.left)}</button>
+        <h1>${s.year}</h1>
+        <button class="icon-btn" data-a="summaryYear" data-v="${s.year + 1}" aria-label="Next year" ${s.year >= Number(today().slice(0, 4)) ? 'disabled' : ''}>${svg(ICONS.right)}</button>
+      </div>
+      ${taxed.length > 0 && html`<div class="field"><span>Income from</span>
+        ${seg('summaryScope', s.scope, [['taxed', 'Wallets with percent tax'], ['all', 'All wallets']])}</div>`}
+      <label class="field"><span>Shown in</span>
+        <select class="input" data-change="summaryCurrency" aria-label="Summary currency">${currencyOptions(s.currency)}</select></label>
+      <section class="card">
+        <div>
+          <div class="hero-label">Income after tax</div>
+          ${heroAmount(`${t.afterTax < 0 ? '−' : ''}${money(Math.abs(t.afterTax), s.currency)}`)}
+        </div>
+        <div class="stats">
+          <div><div class="small">Income</div><div class="stat-value">${money(t.income, s.currency)}</div></div>
+          <div><div class="small">Tax${t.income ? `, ${((t.tax / t.income) * 100).toFixed(1)}% of income` : ''}</div><div class="stat-value">${money(t.tax, s.currency)}</div></div>
+          ${t.refund > 0 && html`<div><div class="small">Tax refunds</div><div class="stat-value">${money(t.refund, s.currency)}</div></div>`}
+          ${t.taxUnpaid > 0 && html`<div><div class="small">Still to pay</div><div class="stat-value">${money(t.taxUnpaid, s.currency)}</div></div>`}
+        </div>
+      </section>
+      <section class="card">
+        <h2 class="section-title">By quarter</h2>
+        <p class="small">In ${s.currency}</p>
+        ${summaryTable('Quarter', quarters)}
+        ${months.length > 0 && html`<details>
+          <summary>Show months</summary>
+          ${summaryTable('Month', months)}
+        </details>`}
+      </section>
+      ${types.length > 0 && html`<section class="card">
+        <h2 class="section-title">By tax</h2>
+        ${types.map((x) => html`<div class="row-between">
+          <span class="budget-name">${badge(x.type, 'badge-small')} ${x.type.name}</span>
+          <span class="value-text">${money(x.value, s.currency)}</span>
+        </div>`)}
+      </section>`}
+      ${missingRateNote(sum.missing)}
+      ${sum.estimated > 0 && html`<p class="small">${sum.estimated} ${sum.estimated === 1 ? 'amount uses' : 'amounts use'} today's rate, because no official rate is saved for that date.</p>`}
+      <button class="btn" data-a="exportTaxSummary">Export to CSV</button>
+      <p class="small">Each amount uses the official NBU rate for its date. Tax counts for the month of its income or due date, whenever it was paid. Check these numbers with your accountant before filing.</p>
     </div>`;
 }
 
@@ -1351,7 +1431,7 @@ function sheetRates() {
           <p class="small">Editing a rate switches to Set by me, so your number stays as you typed it.</p>`
         : html`<p class="small">All your wallets use ${state.currency}, so no rates are needed yet.</p>`}
       <p class="small"><a href="https://www.exchangerate-api.com" target="_blank" rel="noopener">Rates By Exchange Rate API</a></p>
-      <p class="small">Tax, income and spending use the official rate of the <a href="https://bank.gov.ua" target="_blank" rel="noopener">National Bank of Ukraine</a> for their date once it's saved.</p>
+      <p class="small">Tax, income and spending use the official rate of the <a href="https://bank.gov.ua/ua/open-data" target="_blank" rel="noopener">National Bank of Ukraine</a> for their date. Your total uses the rates above.</p>
     </div>`;
 }
 
@@ -1635,6 +1715,7 @@ const SHEETS = {
   rule: sheetRule,
   import: sheetImport,
   taxes: sheetTaxes,
+  taxSummary: sheetTaxSummary,
   tax: sheetTaxItem,
   taxPay: sheetTaxPay,
   taxTypes: sheetTaxTypes,
@@ -2397,6 +2478,28 @@ const actions = {
   openTaxTypes() {
     openSheet({ type: 'taxTypes' });
   },
+  openTaxSummary() {
+    // Tax is usually filed in the currency it's worked out in, so that comes first.
+    const percent = activeTaxTypes().find((x) => x.mode === 'percent');
+    openSheet({
+      type: 'taxSummary',
+      year: Number(today().slice(0, 4)),
+      currency: percent?.currency ?? state.currency,
+      scope: taxedWalletIds().length ? 'taxed' : 'all',
+    });
+  },
+  summaryYear({ v }) {
+    ui.sheet.year = Number(v);
+    render();
+  },
+  summaryScope({ v }) {
+    ui.sheet.scope = v;
+    render();
+  },
+  async exportTaxSummary() {
+    const s = ui.sheet;
+    await deliverFile(`tax-summary-${s.year}-${s.currency}.csv`, 'text/csv', C.yearSummaryCSV(state, currentSummary(s)));
+  },
   newTaxType() {
     openSheet({
       type: 'taxType',
@@ -2848,6 +2951,10 @@ const changes = {
     if (f.foreign === wallet(f.walletId).currency) f.foreign = '';
     f.chargedEdited = false;
     fillCharged(f);
+    render();
+  },
+  summaryCurrency(el) {
+    ui.sheet.currency = el.value;
     render();
   },
   payForm() {

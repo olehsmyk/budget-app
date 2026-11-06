@@ -1,5 +1,5 @@
 // Bump CACHE whenever any file below changes, so phones pick up the new version.
-const CACHE = 'budget-v11';
+const CACHE = 'budget-v12';
 const FILES = [
   './',
   'index.html',
@@ -7,6 +7,7 @@ const FILES = [
   'app.js',
   'core.js',
   'category-icons.js',
+  'nbu-history.js',
   'manifest.webmanifest',
   'icons/icon-180.png',
   'icons/icon-192.png',
