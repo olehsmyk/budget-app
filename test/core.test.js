@@ -354,7 +354,7 @@ test('data saved by the first version upgrades with nothing lost', () => {
   const out = C.validateBackup(JSON.parse(original));
 
   assert.equal(JSON.stringify(v1), original, 'the input is not modified');
-  assert.equal(out.version, 3);
+  assert.equal(out.version, 4);
   assert.equal(out.currency, 'UAH');
   assert.deepEqual(out.wallets.map((w) => [w.name, w.currency, w.opening]), [['Main', 'UAH', 0]]);
   assert.deepEqual(out.tx.map((t) => [t.id, t.amount, t.note, t.walletId]), [
@@ -425,7 +425,7 @@ test('version 2 data gains the new default categories without touching what is t
   v2.tx.push({ id: '1', date: '2026-11-01', type: 'expense', amount: 100, walletId: 'w0', categoryId: 'c0', note: '' });
 
   const out = C.validateBackup(JSON.parse(JSON.stringify(v2)));
-  assert.equal(out.version, 3);
+  assert.equal(out.version, 4);
   assert.equal(out.categories[0].name, 'Food shop');
   assert.equal(out.categories[0].limit, 1234);
   assert.equal(out.categories.filter((c) => c.name.toLowerCase() === 'taxi').length, 1, 'no duplicate, even of a hidden one');
@@ -873,4 +873,369 @@ test('a starting balance is a repeat only when the wallet already has that amoun
   const state = multiCurrencyState();
   const built = { tx: [], openings: new Map([['eur', 100000], ['usd', 1]]) };
   assert.deepEqual([...C.findRepeats(state, built).openings], ['eur']);
+});
+
+// ---------- Tax ----------
+
+// A version 3 backup with made-up entries in the old Taxes category.
+function v3WithTaxes() {
+  const state = multiCurrencyState();
+  const taxes = state.categories.find((c) => c.name === 'Taxes');
+  delete state.taxTypes;
+  delete state.taxes;
+  delete state.nbu;
+  delete state.pendingRates;
+  state.version = 3;
+  taxes.archived = false;
+  state.categories = state.categories.filter((c) => !['Fees', 'Tax refund'].includes(c.name));
+  const entry = (id, date, amount, walletId, note) => ({ id, date, type: 'expense', amount, walletId, categoryId: taxes.id, note });
+  state.tx = [
+    entry('a', '2026-07-08', 4300, 'usd', 'ЄСВ'),
+    entry('b', '2026-07-08', 4300, 'usd', 'ЄСВ'),
+    entry('c', '2026-07-08', 5800, 'usd', 'ЄП'),
+    entry('d', '2026-02-07', 3000, 'eur', 'Service fee'),
+    entry('e', '2026-02-26', 1000, 'eur', ''),
+    { id: 'f', date: '2026-07-01', type: 'expense', amount: 700, walletId: 'usd', categoryId: 'c0', note: 'Lunch' },
+  ];
+  return state;
+}
+
+test('upgrading to version 4 keeps every balance and moves taxes out of spending', () => {
+  const old = v3WithTaxes();
+  const before = C.balances(old);
+  const out = C.validateBackup(JSON.parse(JSON.stringify(old)));
+  assert.equal(out.version, 4);
+  assert.deepEqual(C.balances(out), before);
+  assert.equal(out.tx.length, 6);
+  assert.equal(out.tx.filter((t) => t.type === 'tax').length, 3);
+  assert.equal(out.taxes.length, 3);
+  assert.deepEqual(out.upgradeNotice, { taxes: 3, fees: 2 });
+  assert.equal(C.summarize(out, out.tx.filter((t) => t.date.startsWith('2026-07'))).expense, Math.round(700 * 0.9));
+});
+
+test('the upgrade counts fees as fees, including one with no note in the same wallet', () => {
+  const out = C.validateBackup(v3WithTaxes());
+  const fees = out.categories.find((c) => c.name === 'Fees');
+  assert.equal(out.tx.find((t) => t.id === 'd').categoryId, fees.id);
+  assert.equal(out.tx.find((t) => t.id === 'e').categoryId, fees.id);
+  assert.equal(out.categories.find((c) => c.name === 'Taxes').archived, true);
+  assert.ok(out.categories.find((c) => c.name === 'Tax refund' && c.kind === 'income'));
+});
+
+test('a second payment of a tax on one day counts for the month that was missed', () => {
+  const out = C.validateBackup(v3WithTaxes());
+  const type = out.taxTypes.find((x) => x.name === 'ЄСВ');
+  const dates = out.taxes.filter((x) => x.taxTypeId === type.id).map((x) => x.date).sort();
+  assert.deepEqual(dates, ['2026-06-08', '2026-07-08']);
+  const paidOn = out.tx.filter((t) => t.note === 'ЄСВ').map((t) => t.date);
+  assert.deepEqual(paidOn, ['2026-07-08', '2026-07-08']);
+});
+
+test('the upgrade recognises common taxes and past taxes are fully paid', () => {
+  const out = C.validateBackup(v3WithTaxes());
+  const single = out.taxTypes.find((x) => x.name === 'ЄП');
+  assert.equal(single.mode, 'percent');
+  assert.equal(single.rate, 5);
+  assert.deepEqual(single.walletIds, ['usd']);
+  assert.equal(out.taxTypes.find((x) => x.name === 'ЄСВ').mode, 'fixed');
+  assert.deepEqual(C.unpaidTaxes(out), []);
+});
+
+test('version 4 data round-trips through a backup unchanged', () => {
+  const out = C.validateBackup(v3WithTaxes());
+  const again = C.validateBackup(JSON.parse(JSON.stringify(out)));
+  assert.deepEqual(again, JSON.parse(JSON.stringify(out)));
+});
+
+test('a backup with a tax payment pointing nowhere is refused', () => {
+  const out = C.validateBackup(v3WithTaxes());
+  out.taxes = out.taxes.slice(1);
+  assert.throws(() => C.validateBackup(out), /bad tax payment/);
+});
+
+// A USD wallet with a 5% tax calculated in USD, so the numbers read simply.
+function taxState() {
+  const state = multiCurrencyState();
+  state.taxTypes = [{ id: 'single', name: 'Single tax', icon: 'tag', color: 'blue', mode: 'percent', rate: 5, currency: 'USD', walletIds: ['usd'], archived: false }];
+  return state;
+}
+const income = (state, amount = 150000, date = '2026-07-01') => {
+  const t = { id: C.uid(), date, type: 'income', amount, walletId: 'usd', categoryId: 'c11', note: '' };
+  state.tx.push(t);
+  return t;
+};
+
+test('income at 5% should pay 5%, and the wallet does not change until it is paid', () => {
+  const state = taxState();
+  const inc = income(state);
+  const tax = C.addIncomeTax(state, inc, 'single', 5);
+  assert.equal(tax.dueAmount, 7500);
+  assert.equal(C.balances(state).get('usd'), 50000 + 150000);
+  const status = C.taxStatus(state, tax);
+  assert.equal(status.remaining, 7500);
+  assert.equal(status.settled, false);
+  assert.deepEqual(C.unpaidTaxes(state), [tax]);
+});
+
+test('paying a bit more shows the new percentage and the difference', () => {
+  const state = taxState();
+  const tax = C.addIncomeTax(state, income(state), 'single', 5);
+  C.addTaxPayment(state, tax, { walletId: 'usd', amount: 7557, taxAmount: 7557, date: '2026-07-20' });
+  const status = C.taxStatus(state, tax);
+  assert.equal(status.paid, 7557);
+  assert.equal(status.difference, 57);
+  assert.equal(status.settled, true);
+  assert.equal(status.paidPercent.toFixed(2), '5.04');
+  assert.equal(C.balances(state).get('usd'), 50000 + 150000 - 7557);
+  assert.deepEqual(C.unpaidTaxes(state), []);
+});
+
+test('a partial payment stays open with the remainder', () => {
+  const state = taxState();
+  const tax = C.addIncomeTax(state, income(state), 'single', 5);
+  C.addTaxPayment(state, tax, { walletId: 'usd', amount: 5000, taxAmount: 5000, date: '2026-07-20' });
+  assert.equal(C.taxStatus(state, tax).remaining, 2500);
+  assert.deepEqual(C.unpaidTaxes(state), [tax]);
+});
+
+test('extra paid on one tax does not reduce another', () => {
+  const state = taxState();
+  const first = C.addIncomeTax(state, income(state), 'single', 5);
+  const second = C.addIncomeTax(state, income(state), 'single', 5);
+  C.addTaxPayment(state, first, { walletId: 'usd', amount: 9000, taxAmount: 9000, date: '2026-07-20' });
+  assert.equal(C.taxStatus(state, second).remaining, 7500);
+});
+
+test('a tax paid from a wallet in another currency compares in the tax currency', () => {
+  const state = taxState();
+  const tax = C.addIncomeTax(state, income(state), 'single', 5);
+  C.addTaxPayment(state, tax, { walletId: 'eur', amount: 6750, taxAmount: 7500, date: '2026-07-20' });
+  assert.equal(C.taxStatus(state, tax).settled, true);
+  assert.equal(C.balances(state).get('eur'), 100000 - 6750);
+  const payment = state.tx.at(-1);
+  assert.equal(payment.foreignAmount, 7500);
+  assert.equal(payment.foreignCurrency, 'USD');
+});
+
+test('tax is calculated in the tax currency at the NBU rate on the income date', () => {
+  const state = taxState();
+  state.taxTypes[0].currency = 'UAH';
+  state.nbu['2026-07-01'] = { USD: 40 };
+  const tax = C.addIncomeTax(state, income(state), 'single', 5);
+  assert.equal(tax.currency, 'UAH');
+  assert.equal(tax.fx, 40);
+  assert.equal(tax.fxSource, 'nbu');
+  assert.equal(tax.dueAmount, 300000);
+});
+
+test('with no rate saved a tax is estimated, then corrected once the rate arrives', () => {
+  const state = taxState();
+  state.taxTypes[0].currency = 'UAH';
+  state.rates.UAH = 0.02;
+  const tax = C.addIncomeTax(state, income(state), 'single', 5);
+  assert.equal(tax.fxSource, 'estimate');
+  assert.deepEqual(state.pendingRates, ['2026-07-01']);
+  const usdPerUah = 0.9 / 0.02;
+  assert.equal(tax.dueAmount, Math.round(150000 * usdPerUah * 0.05));
+  assert.equal(C.applyNbuRates(state, '2026-07-01', [{ cc: 'USD', rate: 40 }, { cc: 'XXX', rate: 1 }], ['USD']), true);
+  assert.equal(tax.fxSource, 'nbu');
+  assert.equal(tax.dueAmount, 300000);
+  assert.deepEqual(state.nbu['2026-07-01'], { USD: 40 });
+  assert.deepEqual(state.pendingRates, []);
+});
+
+test('an empty NBU answer leaves the date pending, and a saved rate never changes with today\'s', () => {
+  const state = taxState();
+  state.taxTypes[0].currency = 'UAH';
+  state.nbu['2026-07-01'] = { USD: 40 };
+  const tax = C.addIncomeTax(state, income(state), 'single', 5);
+  C.needRate(state, '2026-08-01');
+  assert.equal(C.applyNbuRates(state, '2026-08-01', [], ['USD']), false);
+  assert.deepEqual(state.pendingRates, ['2026-08-01']);
+  state.rates.USD = 5;
+  C.syncIncomeTaxes(state, state.tx[0], {});
+  assert.equal(tax.fx, 40);
+});
+
+test('a rate typed by hand is kept when the official one arrives', () => {
+  const state = taxState();
+  state.taxTypes[0].currency = 'UAH';
+  state.rates.UAH = 0.02;
+  const tax = C.addIncomeTax(state, income(state), 'single', 5);
+  tax.fx = 41;
+  tax.fxSource = 'manual';
+  C.setIncomeTaxDue(state, tax);
+  C.applyNbuRates(state, '2026-07-01', [{ cc: 'USD', rate: 40 }], ['USD']);
+  assert.equal(tax.fx, 41);
+  assert.equal(tax.dueAmount, Math.round(150000 * 41 * 0.05));
+});
+
+test('editing an income updates what it should pay and never what was paid', () => {
+  const state = taxState();
+  const inc = income(state);
+  const tax = C.addIncomeTax(state, inc, 'single', 5);
+  C.addTaxPayment(state, tax, { walletId: 'usd', amount: 7500, taxAmount: 7500, date: '2026-07-20' });
+  inc.amount = 200000;
+  C.syncIncomeTaxes(state, inc, { single: 5 });
+  const status = C.taxStatus(state, tax);
+  assert.equal(tax.dueAmount, 10000);
+  assert.equal(status.paid, 7500);
+  assert.equal(status.remaining, 2500);
+});
+
+test('unticking a tax removes it unless it has been paid', () => {
+  const state = taxState();
+  const inc = income(state);
+  C.addIncomeTax(state, inc, 'single', 5);
+  C.syncIncomeTaxes(state, inc, { single: null });
+  assert.equal(state.taxes.length, 0);
+  const tax = C.addIncomeTax(state, inc, 'single', 5);
+  C.addTaxPayment(state, tax, { walletId: 'usd', amount: 100, taxAmount: 100, date: '2026-07-20' });
+  C.syncIncomeTaxes(state, inc, { single: null });
+  assert.deepEqual(state.taxes, [tax]);
+});
+
+test('deleting an income can keep its taxes or remove only the unpaid ones', () => {
+  const state = taxState();
+  const inc = income(state);
+  const unpaid = C.addIncomeTax(state, inc, 'single', 5);
+  C.detachIncomeTaxes(state, inc.id, true);
+  assert.deepEqual(state.taxes, [unpaid]);
+  assert.equal(unpaid.incomeId, undefined);
+
+  const other = income(state);
+  const a = C.addIncomeTax(state, other, 'single', 5);
+  const b = C.addIncomeTax(state, other, 'single', 1);
+  C.addTaxPayment(state, b, { walletId: 'usd', amount: 100, taxAmount: 100, date: '2026-07-20' });
+  C.detachIncomeTaxes(state, other.id, false);
+  assert.ok(!state.taxes.includes(a));
+  assert.ok(state.taxes.includes(b));
+  assert.equal(state.tx.at(-1).taxId, b.id);
+});
+
+test('tax counts for the income month, whenever it is paid, and never as spending', () => {
+  const state = taxState();
+  state.currency = 'USD';
+  state.rates = { EUR: 1.1 };
+  const tax = C.addIncomeTax(state, income(state), 'single', 5);
+  C.addTaxPayment(state, tax, { walletId: 'usd', amount: 5000, taxAmount: 5000, date: '2026-08-20' });
+  const july = C.monthTaxes(state, '2026-07');
+  assert.equal(july.paid, 5000);
+  assert.equal(july.unpaid, 2500);
+  assert.equal(C.monthTaxes(state, '2026-08').paid, 0);
+  assert.equal(C.summarize(state, C.txInMonth(state.tx, '2026-08')).expense, 0);
+  const [row] = C.trend(state, '2026-07', 1);
+  assert.equal(row.tax, 7500);
+  assert.equal(row.taxPaid, 5000);
+  assert.equal(row.taxUnpaid, 2500);
+  assert.equal(row.expense, 0);
+});
+
+test('a recurring tax comes due with no income and waits to be paid', () => {
+  const state = taxState();
+  state.taxTypes.push({ id: 'esv', name: 'Social', icon: 'tag', color: 'red', mode: 'fixed', rate: null, currency: 'USD', walletIds: [], archived: false });
+  state.recurring = [{ id: 'r', type: 'tax', taxTypeId: 'esv', walletId: 'usd', amount: 4300, freq: 'monthly', start: '2026-07-10', lastRun: null, note: '' }];
+  assert.equal(C.applyRecurring(state, '2026-08-15'), 2);
+  assert.equal(state.taxes.length, 2);
+  assert.equal(state.tx.length, 0);
+  assert.equal(C.balances(state).get('usd'), 50000);
+  assert.equal(C.unpaidTaxes(state).length, 2);
+  assert.equal(C.applyRecurring(state, '2026-08-15'), 0);
+});
+
+test('a recurring tax can be priced in another currency', () => {
+  const state = taxState();
+  state.taxTypes.push({ id: 'esv', name: 'Social', icon: 'tag', color: 'red', mode: 'fixed', rate: null, currency: 'USD', walletIds: [], archived: false });
+  state.recurring = [{ id: 'r', type: 'tax', taxTypeId: 'esv', walletId: 'eur', amount: 900, foreignAmount: 1000, foreignCurrency: 'USD', freq: 'monthly', start: '2026-07-10', lastRun: null, note: '' }];
+  C.applyRecurring(state, '2026-07-10');
+  assert.equal(state.taxes[0].dueAmount, 1000);
+  assert.equal(state.taxes[0].currency, 'USD');
+  assert.equal(C.payAllTaxes(state, '2026-07-11', (x) => x.walletId), 1);
+  const payment = state.tx[0];
+  assert.equal(payment.amount, 900);
+  assert.equal(payment.foreignAmount, 1000);
+  assert.deepEqual(C.unpaidTaxes(state), []);
+});
+
+test('recurring income adds its linked taxes, and only for a wallet they apply to', () => {
+  const state = taxState();
+  state.recurring = [
+    { id: 'r1', type: 'income', categoryId: 'c11', walletId: 'usd', amount: 100000, freq: 'monthly', start: '2026-07-01', lastRun: null, note: '' },
+    { id: 'r2', type: 'income', categoryId: 'c11', walletId: 'eur', amount: 100000, freq: 'monthly', start: '2026-07-01', lastRun: null, note: '' },
+  ];
+  C.applyRecurring(state, '2026-07-01');
+  assert.equal(state.taxes.length, 1);
+  assert.equal(state.taxes[0].dueAmount, 5000);
+  assert.equal(state.taxes[0].walletId, 'usd');
+});
+
+test('planned months show tax without changing balances or creating anything', () => {
+  const state = taxState();
+  state.taxTypes.push({ id: 'esv', name: 'Social', icon: 'tag', color: 'red', mode: 'fixed', rate: null, currency: 'USD', walletIds: [], archived: false });
+  state.recurring = [
+    { id: 'r1', type: 'income', categoryId: 'c11', walletId: 'usd', amount: 100000, freq: 'monthly', start: '2026-09-01', lastRun: null, note: '' },
+    { id: 'r2', type: 'tax', taxTypeId: 'esv', walletId: 'usd', amount: 4300, freq: 'monthly', start: '2026-09-10', lastRun: null, note: '' },
+  ];
+  const list = C.plannedEntries(state, '2026-09', '2026-08-01');
+  assert.equal(list.filter((t) => t.type === 'tax').length, 2);
+  const sum = C.summarize(state, list);
+  assert.equal(sum.expense, 0);
+  assert.equal(sum.plannedTax, Math.round((5000 + 4300) * 0.9));
+  assert.equal(state.taxes.length, 0);
+  assert.equal(C.balances(state, '2026-08-01').get('usd'), 50000);
+  const [row] = C.trend(state, '2026-09', 1, '2026-08-01');
+  assert.equal(row.tax, Math.round((5000 + 4300) * 0.9));
+  assert.equal(row.taxPaid, 0);
+});
+
+test('past totals use the saved rate for their date, and today\'s rate only without one', () => {
+  const state = multiCurrencyState();
+  state.currency = 'UAH';
+  state.rates = { USD: 50, EUR: 60 };
+  state.nbu['2026-07-01'] = { USD: 40 };
+  const t = (id, date) => ({ id, date, type: 'income', amount: 1000, walletId: 'usd', categoryId: 'c11', note: '' });
+  assert.equal(C.summarize(state, [t('a', '2026-07-01')]).income, 40000);
+  assert.equal(C.summarize(state, [t('b', '2026-07-02')]).income, 50000);
+  assert.equal(C.netWorth({ ...state, tx: [], wallets: [state.wallets[1]] }).total, 50000 * 50);
+});
+
+test('paying all pays what is left of each tax, from the wallet chosen for it', () => {
+  const state = taxState();
+  const tax = C.addIncomeTax(state, income(state), 'single', 5);
+  C.addTaxPayment(state, tax, { walletId: 'usd', amount: 5000, taxAmount: 5000, date: '2026-07-20' });
+  assert.equal(C.payAllTaxes(state, '2026-07-25', (x) => x.walletId), 1);
+  assert.equal(state.tx.at(-1).amount, 2500);
+  assert.deepEqual(C.unpaidTaxes(state), []);
+});
+
+test('tax payments export with their type, and read back as tax', () => {
+  const state = taxState();
+  const tax = C.addIncomeTax(state, income(state), 'single', 5);
+  C.addTaxPayment(state, tax, { walletId: 'usd', amount: 7500, taxAmount: 7500, date: '2026-07-20' });
+  const csv = C.toCSV(state);
+  assert.match(csv, /2026-07-20,tax,Car,75\.00,USD,Single tax/);
+  const [headers, ...rows] = C.parseCSV(csv);
+  const built = C.liftImportedTaxes(state, C.buildImport(rows, C.guessMapping(headers), 'ymd', state.categories, state.wallets, 'usd'));
+  assert.equal(built.tx.filter((t) => t.type === 'tax').length, 1);
+  assert.equal(built.taxes.length, 1);
+  assert.equal(built.newTaxTypes.length, 0);
+  assert.equal(C.findRepeats(state, built).entries.has(built.tx.find((t) => t.type === 'tax').id), true);
+});
+
+test('a Monefy tax category imports as tax and fees as fees, and a second import repeats nothing new', () => {
+  const state = C.defaultState('2026-01-01');
+  state.currency = 'USD';
+  const map = { date: 0, type: 1, amount: 2, category: 3, note: 4, wallet: -1, currency: -1 };
+  const rows = [['2026-07-08', 'expense', '43.06', 'Податки', 'ЄСВ'], ['2026-07-01', 'expense', '20', 'Податки', 'Service fee']];
+  const build = () => C.liftImportedTaxes(state, C.buildImport(rows, map, 'ymd', state.categories, state.wallets, 'w0'));
+  const first = build();
+  assert.equal(first.taxes.length, 1);
+  assert.equal(first.newTaxTypes[0].name, 'ЄСВ');
+  assert.equal(first.tx.find((t) => t.note === 'Service fee').categoryId, state.categories.find((c) => c.name === 'Fees').id);
+  state.tx.push(...first.tx);
+  state.taxes.push(...first.taxes);
+  state.taxTypes.push(...first.newTaxTypes);
+  const second = build();
+  assert.equal(C.findRepeats(state, second).entries.size, 2);
+  assert.equal(second.newTaxTypes.length, 0);
 });

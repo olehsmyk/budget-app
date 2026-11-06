@@ -35,6 +35,17 @@ const html = (strings, ...values) =>
 
 // ---------- State ----------
 
+const BEFORE_TAX_KEY = `${KEY}.before-tax`;
+
+// A full copy from before tax moved out of spending. A full phone must not stop the app from opening.
+function keepBeforeTaxCopy(raw) {
+  try {
+    localStorage.setItem(BEFORE_TAX_KEY, raw);
+  } catch {
+    // The upgrade itself changes no balances, and the banner still offers a backup.
+  }
+}
+
 function load() {
   const raw = localStorage.getItem(KEY);
   if (!raw) return C.defaultState(today());
@@ -43,6 +54,7 @@ function load() {
     const loaded = C.validateBackup(saved);
     // Keep an untouched copy of the first format, then store the upgraded data.
     if (saved.version < 2) localStorage.setItem(`${KEY}.before-wallets`, raw);
+    if (saved.version < 4) keepBeforeTaxCopy(raw);
     if (saved.version !== loaded.version) localStorage.setItem(KEY, JSON.stringify(loaded));
     return loaded;
   } catch {
@@ -88,7 +100,15 @@ const activeWallets =() => state.wallets.filter((w) => !w.archived);
 const otherWallet = (id) => activeWallets().find((w) => w.id !== id)?.id ?? null;
 const defaultWalletId = () => (wallet(state.lastWalletId)?.archived === false ? state.lastWalletId : activeWallets()[0].id);
 const walletInUse = (id) =>
-  state.tx.some((t) => t.walletId === id || t.toWalletId === id) || state.recurring.some((r) => r.walletId === id);
+  state.tx.some((t) => t.walletId === id || t.toWalletId === id) ||
+  state.recurring.some((r) => r.walletId === id) ||
+  state.taxes.some((x) => x.walletId === id);
+const taxType = (id) => state.taxTypes.find((x) => x.id === id);
+const taxItem = (id) => state.taxes.find((x) => x.id === id);
+const activeTaxTypes = () => state.taxTypes.filter((x) => !x.archived);
+const fixedTaxTypes = () => activeTaxTypes().filter((x) => x.mode === 'fixed');
+// The wallet a tax is normally paid from, as long as it's still around and visible.
+const payerWallet = (tax) => (wallet(tax.walletId)?.archived === false ? tax.walletId : defaultWalletId());
 
 // A wallet's currency, plus the one already chosen on a form even if that wallet is now hidden.
 const walletChoices = (selectedId) => {
@@ -216,9 +236,9 @@ function correctionRow(t) {
 }
 
 function plannedRow(t) {
-  const c = category(t.categoryId);
+  const c = t.type === 'tax' ? taxType(t.taxTypeId) : category(t.categoryId);
   const w = wallet(t.walletId);
-  const details = [`Planned ${dayMonth(t.date)}`, t.note && c.name, state.wallets.length > 1 && w.name].filter(Boolean);
+  const details = [`Planned ${dayMonth(t.date)}`, t.type === 'tax' && 'Tax', t.note && c.name, state.wallets.length > 1 && w.name].filter(Boolean);
   return html`<button class="tx tx-planned" data-a="editRule" data-id="${t.ruleId}">
     ${badge(c)}
     <span class="tx-main">
@@ -248,6 +268,20 @@ function txRow(t) {
       </span>
     </button>`;
   }
+  if (t.type === 'tax') {
+    const type = taxType(taxItem(t.taxId).taxTypeId);
+    const details = ['Tax', t.note && type.name, state.wallets.length > 1 && w.name].filter(Boolean);
+    return html`<button class="tx" data-a="editPayment" data-id="${t.id}">
+      ${badge(type)}
+      <span class="tx-main">
+        <div class="tx-title">${t.note || type.name}</div>
+        <div class="tx-sub">${details.join(' · ')}</div>
+      </span>
+      <span class="tx-amount">−${money(t.amount, w.currency)}
+        ${t.foreignCurrency && html`<div class="tx-sub">${money(t.foreignAmount, t.foreignCurrency)}</div>`}
+      </span>
+    </button>`;
+  }
   const c = category(t.categoryId);
   const details = [t.note && c.name, state.wallets.length > 1 && w.name, t.recurringId && 'Recurring'].filter(Boolean);
   return html`<button class="tx" data-a="editTx" data-id="${t.id}">
@@ -260,6 +294,31 @@ function txRow(t) {
       ${t.foreignCurrency && html`<div class="tx-sub">${money(t.foreignAmount, t.foreignCurrency)}</div>`}
     </span>
   </button>`;
+}
+
+// One tax in a list. Open ones show what's left, and finished ones what was paid.
+function taxRow(tax, withPay) {
+  const type = taxType(tax.taxTypeId);
+  const status = C.taxStatus(state, tax);
+  const details = [
+    dayMonth(tax.date),
+    tax.rate && `${tax.rate}% of ${money(tax.base, tax.baseCurrency)}`,
+    status.paid > 0 && !status.settled && 'Part paid',
+    tax.fxSource === 'estimate' && 'Estimate',
+  ].filter(Boolean);
+  return html`<div class="tax-row">
+    <button class="tx" data-a="openTax" data-id="${tax.id}">
+      ${badge(type)}
+      <span class="tx-main">
+        <div class="tx-title">${tax.note || type.name}</div>
+        <div class="tx-sub">${details.join(' · ')}</div>
+      </span>
+      <span class="tx-amount">${money(status.settled ? status.paid : status.remaining, tax.currency)}
+        ${status.settled && status.difference !== 0 && html`<div class="tx-sub">${signedMoney(status.difference, tax.currency)}</div>`}
+      </span>
+    </button>
+    ${withPay && html`<button class="pay-btn" data-a="payTax" data-id="${tax.id}" aria-label="Pay ${type.name}">Pay</button>`}
+  </div>`;
 }
 
 const txGroups = (list) => {
@@ -342,7 +401,35 @@ function banners() {
       <span>Your data lives only on this phone.</span>
       <button class="link" data-a="backup">Back up now</button></div>`);
   }
+  if (state.upgradeNotice) {
+    const { taxes, fees } = state.upgradeNotice;
+    out.push(html`<div class="banner"><strong>Tax is now separate from spending</strong>
+      <span>${taxes} past tax ${taxes === 1 ? 'payment' : 'payments'} moved out of spending, and ${fees} ${fees === 1 ? 'fee' : 'fees'} moved to Fees. Your wallet balances didn't change.</span>
+      <div class="btn-links"><button class="link" data-a="backup">Back up now</button>
+      <button class="link" data-a="dismissUpgrade">Got it</button></div></div>`);
+  }
   return out;
+}
+
+function taxToPayCard() {
+  const unpaid = C.unpaidTaxes(state);
+  if (!unpaid.length) return null;
+  let total = 0;
+  let converted = false;
+  for (const tax of unpaid) {
+    total += C.convertOn(state, C.taxStatus(state, tax).remaining, tax.currency, tax.date) ?? 0;
+    if (tax.currency !== state.currency) converted = true;
+  }
+  return html`<section class="card">
+    <div class="row-between">
+      <h2 class="section-title">Tax to pay</h2>
+      <button class="link" data-a="openTaxes">See all</button>
+    </div>
+    ${heroAmount(approx(converted) + money(total))}
+    <div class="wallet-list">${unpaid.slice(0, 3).map((tax) => taxRow(tax, true))}</div>
+    ${unpaid.length > 3 && html`<p class="small">And ${unpaid.length - 3} more.</p>`}
+    ${unpaid.length > 1 && html`<button class="btn" data-a="payAll">Pay all</button>`}
+  </section>`;
 }
 
 function walletsCard() {
@@ -398,9 +485,14 @@ function viewHome() {
     .sort((a, b) => b.spent / b.c.limit - a.spent / a.c.limit);
   const totalLimit = limited.reduce((sum, x) => sum + x.c.limit, 0);
   const limitedSpent = limited.reduce((sum, x) => sum + x.spent, 0);
-  const net = income - expense;
+  const taxes = C.monthTaxes(state, ui.month);
+  const tax = taxes.paid + taxes.unpaid + summary.plannedTax;
+  const afterTax = income - tax;
+  const net = afterTax - expense;
+  const estimated = converted || taxes.converted;
+  const signed = (cents) => `${approx(estimated)}${cents < 0 ? '−' : ''}${money(Math.abs(cents))}`;
 
-  return html`${banners()}${walletsCard()}${monthNav()}
+  return html`${banners()}${walletsCard()}${taxToPayCard()}${monthNav()}
     <section class="card">
       <div>
         <div class="hero-label">${future ? 'Planned spending' : 'Spent'}</div>
@@ -409,13 +501,15 @@ function viewHome() {
       ${totalLimit > 0 && html`${budgetBar(limitedSpent, totalLimit)}
         <div class="small">${leftText(limitedSpent, totalLimit)} of ${money(totalLimit)} budgeted</div>`}
       <div class="stats">
-        <div><div class="small">Income</div><div class="stat-value">${approx(converted)}${money(income)}</div></div>
-        <div><div class="small">Net</div><div class="stat-value">${approx(converted)}${net < 0 ? '−' : ''}${money(Math.abs(net))}</div></div>
+        <div><div class="small">Income</div><div class="stat-value">${signed(income)}</div></div>
+        <button class="stat-link" data-a="openTaxes"><div class="small">Tax ›</div><div class="stat-value">${signed(tax)}</div></button>
+        <div><div class="small">After tax</div><div class="stat-value">${signed(afterTax)}</div></div>
+        <div><div class="small">Net after spending</div><div class="stat-value">${signed(net)}</div></div>
       </div>
       ${stillPlanned.length > 0 && html`<p class="small">Still planned this month: ${
-        [stillTotals.expense && `≈ −${money(stillTotals.expense)}`, stillTotals.income && `≈ +${money(stillTotals.income)}`].filter(Boolean).join(', ')
+        [stillTotals.expense && `≈ −${money(stillTotals.expense)}`, stillTotals.income && `≈ +${money(stillTotals.income)}`, stillTotals.plannedTax && `≈ ${money(stillTotals.plannedTax)} tax`].filter(Boolean).join(', ')
       }</p>`}
-      ${missingRateNote(missing)}
+      ${missingRateNote(new Set([...missing, ...taxes.missing]))}
     </section>
 
     <section class="card">
@@ -475,7 +569,11 @@ function activityResults() {
   if (ui.filterWallet) list = list.filter((t) => t.walletId === ui.filterWallet || t.toWalletId === ui.filterWallet);
   if (q) {
     list = list.filter((t) => {
-      const label = t.type === 'transfer' ? 'transfer' : t.type === 'adjustment' ? 'balance correction' : category(t.categoryId).name;
+      const label =
+        t.type === 'transfer' ? 'transfer'
+        : t.type === 'adjustment' ? 'balance correction'
+        : t.type === 'tax' ? `tax ${taxType(taxItem(t.taxId).taxTypeId).name}`
+        : category(t.categoryId).name;
       return `${t.note || ''} ${label} ${wallet(t.walletId).name}`.toLowerCase().includes(q);
     });
   }
@@ -529,6 +627,7 @@ function trendEnd() {
 
 function barPath(x, y, w, h, r) {
   const radius = Math.min(r, h, w / 2);
+  if (!radius) return `M${x} ${y + h}V${y}H${x + w}V${y + h}Z`;
   return `M${x} ${y + h}V${y + radius}Q${x} ${y} ${x + radius} ${y}H${x + w - radius}Q${x + w} ${y} ${x + w} ${y + radius}V${y + h}Z`;
 }
 
@@ -538,11 +637,12 @@ function trendChart(rows) {
   const top = 8;
   const bottom = 24;
   const plotH = H - top - bottom;
-  const max = C.niceMax(Math.max(...rows.map((r) => Math.max(r.income, r.expense))));
+  const max = C.niceMax(Math.max(...rows.map((r) => Math.max(r.income, r.expense, r.tax))));
   // Room for the longest axis label, which depends on the currency and the amounts.
   const left = Math.max(46, Math.max(...[0, max / 2, max].map((v) => moneyCompact(v).length)) * 6.5 + 8);
   const groupW = (W - left) / rows.length;
-  const barW = Math.min(14, (groupW - 10) / 2);
+  const GAP = 2;
+  const barW = Math.min(12, (groupW - 8 - GAP * 2) / 3);
   const yOf = (v) => top + plotH - (v / max) * plotH;
 
   const grid = [0, 0.5, 1].map((f) => {
@@ -555,7 +655,7 @@ function trendChart(rows) {
     const gx = left + i * groupW;
     return html`<rect class="hit ${r.key === ui.month ? 'selected' : ''}" x="${gx + 2}" y="0" width="${groupW - 4}" height="${H}" rx="8"
       data-a="pickMonth" data-key="${r.key}" role="button"
-      aria-label="${monthLabel(r.key)}${r.planned ? ' (planned)' : ''}: income ${money(r.income)}, expenses ${money(r.expense)}"></rect>`;
+      aria-label="${monthLabel(r.key)}${r.planned ? ' (planned)' : ''}: income ${money(r.income)}, expenses ${money(r.expense)}, tax ${money(r.tax)}"></rect>`;
   });
 
   const bars = rows.map((r, i) => {
@@ -565,12 +665,21 @@ function trendChart(rows) {
       const h = Math.max(2, (value / max) * plotH);
       return html`<path class="${cls} ${r.planned ? 'planned' : ''}" d="${barPath(x, top + plotH - h, barW, h, 4)}"></path>`;
     };
-    return html`${bar(r.income, cx - barW - 1, 'income')}
-      ${bar(r.expense, cx + 1, 'expense')}
+    // Paid tax sits on the baseline, with what's still unpaid or planned in a lighter shade on top.
+    const taxX = cx + barW / 2 + GAP;
+    const later = r.taxUnpaid + r.taxPlanned;
+    const paidH = r.taxPaid ? Math.max(2, (r.taxPaid / max) * plotH) : 0;
+    const laterH = later ? Math.max(2, (later / max) * plotH) : 0;
+    const gap = paidH && laterH ? GAP : 0;
+    const taxBars = html`${paidH > 0 && html`<path class="tax" d="${barPath(taxX, top + plotH - paidH, barW, paidH, laterH ? 0 : 4)}"></path>`}
+      ${laterH > 0 && html`<path class="tax later" d="${barPath(taxX, top + plotH - paidH - gap - laterH, barW, laterH, 4)}"></path>`}`;
+    return html`${bar(r.income, cx - barW * 1.5 - GAP, 'income')}
+      ${bar(r.expense, cx - barW / 2, 'expense')}
+      ${taxBars}
       <text class="${r.key === ui.month ? 'selected' : ''}" x="${cx}" y="${H - 7}" text-anchor="middle">${monthShort(r.key)}</text>`;
   });
 
-  return html`<svg class="chart" viewBox="0 0 ${W} ${H}" role="group" aria-label="Income and expenses by month">
+  return html`<svg class="chart" viewBox="0 0 ${W} ${H}" role="group" aria-label="Income, expenses and tax by month">
     ${hits}<g pointer-events="none">${grid}${bars}</g>
   </svg>`;
 }
@@ -617,6 +726,8 @@ function viewInsights() {
   const top = spent[0]?.amount || 1;
   const rows = C.trend(state, trendEnd(), TREND_MONTHS, today());
   const chosen = rows.find((r) => r.key === ui.month);
+  const taxes = C.monthTaxes(state, ui.month);
+  const monthTax = taxes.paid + taxes.unpaid + s.plannedTax;
 
   return html`${monthNav()}
     <section class="card">
@@ -633,25 +744,30 @@ function viewInsights() {
             </button>`,
           )}`
         : html`<p class="small">${isFutureMonth() ? 'No planned spending this month.' : 'No spending this month.'}</p>`}
-      ${plannedNote(list) || (s.converted && html`<p class="small">Converted to ${state.currency} at your current exchange rates.</p>`)}
+      ${monthTax > 0 && html`<button class="tax-line" data-a="openTaxes">
+        <span class="budget-name">Tax</span>
+        <span class="small">${money(monthTax)} · not part of spending ›</span>
+      </button>`}
+      ${plannedNote(list) || (s.converted && html`<p class="small">Converted to ${state.currency} at the rate saved for each date, or today's rate where none is saved.</p>`)}
       ${missingRateNote(s.missing)}
     </section>
 
     <section class="card">
-      <h2 class="section-title">Income and expenses</h2>
+      <h2 class="section-title">Income, expenses and tax</h2>
       <div class="legend">
         <span><i style="background:var(--income)"></i>Income</span>
         <span><i style="background:var(--expense)"></i>Expenses</span>
-        ${rows.some((r) => r.planned) && html`<span>Lighter bars are planned</span>`}
+        <span><i style="background:var(--tax)"></i>Tax</span>
+        <span>Lighter bars are unpaid or planned</span>
       </div>
       ${trendChart(rows)}
-      ${chosen && html`<p class="small">${monthLabel(chosen.key)}${chosen.planned ? ' (planned)' : ''}: income ${money(chosen.income)}, expenses ${money(chosen.expense)}</p>`}
+      ${chosen && html`<p class="small">${monthLabel(chosen.key)}${chosen.planned ? ' (planned)' : ''}: income ${money(chosen.income)}, expenses ${money(chosen.expense)}, tax ${money(chosen.tax)}</p>`}
       <details>
         <summary>Show as table</summary>
         <table class="table">
-          <thead><tr><th>Month</th><th>Income</th><th>Expenses</th></tr></thead>
+          <thead><tr><th>Month</th><th>Income</th><th>Expenses</th><th>Tax</th></tr></thead>
           <tbody>${rows.map(
-            (r) => html`<tr><td>${monthShort(r.key)}${r.planned ? ' (planned)' : ''}</td><td>${money(r.income)}</td><td>${money(r.expense)}</td></tr>`,
+            (r) => html`<tr><td>${monthShort(r.key)}${r.planned ? ' (planned)' : ''}</td><td>${money(r.income)}</td><td>${money(r.expense)}</td><td>${money(r.tax)}</td></tr>`,
           )}</tbody>
         </table>
       </details>
@@ -663,6 +779,14 @@ function viewInsights() {
 function ratesStatus() {
   if (!state.autoRates) return 'Set by you';
   return state.ratesUpdated ? `Updated ${shortMoment(state.ratesUpdated)}` : 'Not updated yet';
+}
+
+function hasBeforeTaxCopy() {
+  try {
+    return localStorage.getItem(BEFORE_TAX_KEY) !== null;
+  } catch {
+    return false;
+  }
 }
 
 function viewSettings() {
@@ -679,6 +803,8 @@ function viewSettings() {
       <button class="set-row" data-a="openCategories"><span>Categories and limits</span><span class="chev">›</span></button>
       <button class="set-row" data-a="openRecurring"><span>Recurring</span>
         <span class="value">${state.recurring.length} ›</span></button>
+      <button class="set-row" data-a="openTaxes"><span>Taxes</span>
+        <span class="value">${C.unpaidTaxes(state).length ? `${C.unpaidTaxes(state).length} to pay` : ''} ›</span></button>
       <button class="set-row" data-a="openCorrections"><span>Balance corrections</span>
         <span class="value">${state.tx.filter((t) => t.type === 'adjustment').length} ›</span></button>
     </section>
@@ -689,6 +815,7 @@ function viewSettings() {
         <span class="value">${state.lastBackup ? `Last: ${shortMoment(state.lastBackup)}` : 'Never'}</span></button>
       <label class="set-row" for="restore-json"><span>Restore from backup</span><span class="chev">›</span></label>
       <label class="set-row" for="import-csv"><span>Import from another app (CSV)</span><span class="chev">›</span></label>
+      ${hasBeforeTaxCopy() && html`<button class="set-row" data-a="saveBeforeTaxCopy"><span>Copy from before the tax update</span><span class="value">Save file</span></button>`}
     </section>
     <p class="small">${state.tx.length} ${state.tx.length === 1 ? 'entry' : 'entries'}, stored only on this device. The only thing the app downloads is exchange rates, and that sends none of your data. Deleting the app deletes this data, so keep a backup in Files or iCloud Drive.</p>`;
 }
@@ -709,7 +836,10 @@ const seg = (action, value, options) =>
   )}</div>`;
 
 const TYPE_OPTIONS = [['expense', 'Expense'], ['income', 'Income']];
-const TX_TYPE_OPTIONS = [...TYPE_OPTIONS, ['transfer', 'Transfer']];
+const RULE_TYPE_OPTIONS = [...TYPE_OPTIONS, ['tax', 'Tax']];
+const TX_TYPE_OPTIONS = [...RULE_TYPE_OPTIONS, ['transfer', 'Transfer']];
+// An existing entry can't turn into a tax: a tax is made from its own form, and can have payments.
+const txTypeOptions = (s) => (s.id ? TX_TYPE_OPTIONS.filter(([v]) => v !== 'tax') : TX_TYPE_OPTIONS);
 
 const walletSelect = (id, label, selectedId, change) =>
   html`<label class="field"><span>${label}</span>
@@ -726,7 +856,7 @@ function sheetTx(s) {
   const from = wallet(f.walletId);
   const footer = html`<label class="field"><span>Date</span><input id="f-date" class="input" type="date" value="${f.date}"></label>
     <label class="field"><span>Note (optional)</span><input id="f-note" class="input" maxlength="120" value="${f.note}"></label>
-    ${s.id && html`<button class="btn btn-danger" data-a="deleteTx">Delete entry</button>`}`;
+    ${s.id && (s.confirmDelete ? deleteIncomeChoice(s) : html`<button class="btn btn-danger" data-a="deleteTx">Delete entry</button>`)}`;
   const priced = (f.type !== 'transfer' && f.foreign) || from.currency;
   const amount = html`<div>
     <input id="f-amount" class="amount-input" inputmode="decimal" autocomplete="off" placeholder="0.00" aria-label="Amount in ${priced}" value="${f.amount}">
@@ -738,7 +868,7 @@ function sheetTx(s) {
     const rate = to && C.crossRate(state, from.currency, to.currency);
     return html`${sheetHead(s.id ? 'Edit transfer' : 'Move money', 'Cancel', 'saveTx')}
       <div class="sheet-body">
-        ${seg('txType', f.type, TX_TYPE_OPTIONS)}
+        ${seg('txType', f.type, txTypeOptions(s))}
         ${amount}
         ${s.error && html`<p class="error">${s.error}</p>`}
         ${walletSelect('f-wallet', 'From', f.walletId, 'txForm')}
@@ -756,6 +886,17 @@ function sheetTx(s) {
   }
 
   const chargedRate = f.foreign && C.crossRate(state, f.foreign, from.currency);
+  const priceFields = html`<label class="field"><span>Price in</span>
+      <select id="f-foreign" class="input" data-change="txForm">${foreignOptions(f.foreign, from.currency)}</select>
+    </label>
+    ${f.foreign && html`<label class="field"><span>${f.type === 'income' ? 'Added to' : 'Taken from'} wallet (${from.currency})</span>
+        <input id="f-charged" class="input" inputmode="decimal" autocomplete="off" placeholder="0.00" value="${f.charged}"></label>
+      <p class="small">${chargedRate
+        ? `Today's rate: 1 ${f.foreign} = ${formatRate(chargedRate)} ${from.currency}. Change the amount to match what really moved.`
+        : `No exchange rate saved for ${f.foreign}, so enter the amount that really moved.`}</p>`}`;
+
+  if (f.type === 'tax') return sheetTaxEntry(s, amount, priceFields, footer);
+
   const cats = categoriesByUse(f.type);
   const current = category(f.categoryId);
   // An archived category stays selectable when editing an old entry that uses it.
@@ -767,7 +908,7 @@ function sheetTx(s) {
     : current && !top.includes(current) && current.kind === f.type ? [...top.slice(0, -1), current] : top;
   return html`${sheetHead(s.id ? 'Edit entry' : 'New entry', 'Cancel', 'saveTx')}
     <div class="sheet-body">
-      ${seg('txType', f.type, TX_TYPE_OPTIONS)}
+      ${seg('txType', f.type, txTypeOptions(s))}
       ${amount}
       ${s.error && html`<p class="error">${s.error}</p>`}
       ${walletSelect('f-wallet', 'Wallet', f.walletId, 'txForm')}
@@ -776,15 +917,326 @@ function sheetTx(s) {
           ${badge(c)}${c.name}</button>`,
       )}</div>
       ${choices.length < all.length && html`<button type="button" class="btn" data-a="showAllCategories">All categories (${all.length})</button>`}
-      <label class="field"><span>Price in</span>
-        <select id="f-foreign" class="input" data-change="txForm">${foreignOptions(f.foreign, from.currency)}</select>
-      </label>
-      ${f.foreign && html`<label class="field"><span>${f.type === 'income' ? 'Added to' : 'Taken from'} wallet (${from.currency})</span>
-          <input id="f-charged" class="input" inputmode="decimal" autocomplete="off" placeholder="0.00" value="${f.charged}"></label>
-        <p class="small">${chargedRate
-          ? `Today's rate: 1 ${f.foreign} = ${formatRate(chargedRate)} ${from.currency}. Change the amount to match what really moved.`
-          : `No exchange rate saved for ${f.foreign}, so enter the amount that really moved.`}</p>`}
+      ${priceFields}
+      ${f.type === 'income' && incomeTaxFields(s)}
       ${footer}
+    </div>`;
+}
+
+// The amount that really reached the wallet, which is what a percentage tax is taken from.
+function incomeInWallet(f) {
+  const text = f.foreign ? f.charged : f.amount;
+  return Math.abs(C.parseAmount(text) ?? 0);
+}
+
+// Taxes offered on an income: those linked to its wallet, and any it already has.
+function incomeTaxRows(s) {
+  const f = s.form;
+  const existing = s.id ? state.taxes.filter((x) => x.incomeId === s.id) : [];
+  const types = [...new Set([...C.linkedTaxTypes(state, f.walletId), ...existing.map((x) => taxType(x.taxTypeId))])];
+  return types.map((type) => {
+    const tax = existing.find((x) => x.taxTypeId === type.id);
+    const saved = f.taxes?.[type.id];
+    return {
+      type,
+      paid: Boolean(tax) && C.taxPayments(state, tax.id).length > 0,
+      // An income saved before a tax existed stays as it was until the box is ticked.
+      on: saved?.on ?? (tax ? true : !s.id),
+      rate: saved?.rate ?? String(tax?.rate ?? type.rate),
+    };
+  });
+}
+
+const taxPreview = (f, rateText) => {
+  const rate = C.parseRate(rateText);
+  const cents = incomeInWallet(f);
+  return rate && cents ? `≈ ${money(Math.round((cents * rate) / 100), wallet(f.walletId).currency)}` : '';
+};
+
+function incomeTaxFields(s) {
+  const rows = incomeTaxRows(s);
+  if (!rows.length) return null;
+  return html`<div class="card">
+    <strong>Tax on this income</strong>
+    ${rows.map((x) => html`<div class="tax-check">
+      <label class="tax-check-name">
+        <input type="checkbox" data-tax-on="${x.type.id}" ${x.on ? 'checked' : ''} ${x.paid ? 'disabled' : ''}>
+        ${badge(x.type, 'badge-small')} ${x.type.name}
+      </label>
+      <span class="tax-check-rate"><input class="input" inputmode="decimal" autocomplete="off" aria-label="${x.type.name} percent" data-tax-rate="${x.type.id}" value="${x.rate}">%</span>
+      <span class="small tax-check-amount" data-tax-amount="${x.type.id}">${taxPreview(s.form, x.rate)}</span>
+    </div>`)}
+    <p class="small">${rows.some((x) => x.paid) ? 'A tax with a payment stays, and shows any new difference. ' : ''}Added to Tax to pay. The wallet changes only when you pay it.</p>
+  </div>`;
+}
+
+// Deleting an income that has taxes. Money already paid really left the wallet, so it always stays.
+function deleteIncomeChoice(s) {
+  const linked = state.taxes.filter((x) => x.incomeId === s.id);
+  const paid = linked.filter((x) => C.taxPayments(state, x.id).length > 0).length;
+  return html`<div class="card">
+    <strong>This income has ${linked.length} ${linked.length === 1 ? 'tax' : 'taxes'}</strong>
+    ${paid > 0 && html`<p class="small">${paid} ${paid === 1 ? 'has' : 'have'} payments, which stay either way.</p>`}
+    <button class="btn btn-danger" data-a="deleteIncome" data-keep="">Delete income and unpaid taxes</button>
+    <button class="btn btn-danger" data-a="deleteIncome" data-keep="yes">Delete income, keep taxes</button>
+    <button class="btn" data-a="cancelDelete">Keep the income</button>
+  </div>`;
+}
+
+// Recent income a percentage tax can be taken from, leaving out any that already has this tax.
+function incomeOptions(taxTypeId) {
+  const taken = new Set(state.taxes.filter((x) => x.taxTypeId === taxTypeId).map((x) => x.incomeId));
+  return C.sortTx(state.tx.filter((t) => t.type === 'income' && !taken.has(t.id))).slice(0, 24);
+}
+
+function sheetTaxEntry(s, amount, priceFields, footer) {
+  const f = s.form;
+  const types = activeTaxTypes();
+  const type = taxType(f.taxTypeId);
+  const percent = type?.mode === 'percent';
+  const income = percent && f.incomeId ? state.tx.find((t) => t.id === f.incomeId) : null;
+  const incomeWallet = income && wallet(income.walletId);
+  const rate = C.parseRate(f.taxRate);
+  return html`${sheetHead('New tax', 'Cancel', 'saveTx')}
+    <div class="sheet-body">
+      ${seg('txType', f.type, txTypeOptions(s))}
+      ${!income && amount}
+      ${s.error && html`<p class="error">${s.error}</p>`}
+      ${types.length
+        ? html`<div class="cat-grid">${types.map(
+            (x) => html`<button type="button" class="cat" data-a="txTaxType" data-id="${x.id}" aria-pressed="${x.id === f.taxTypeId}">
+              ${badge(x)}${x.name}</button>`,
+          )}</div>`
+        : html`<p class="small">Add a tax type first, such as a percentage of income or a fixed monthly amount.</p>`}
+      <button type="button" class="btn" data-a="newTaxType">Add tax type</button>
+      ${percent && html`<label class="field"><span>Percentage of</span>
+          <select id="f-income" class="input" data-change="txForm">
+            <option value="">No income, I'll enter the amount</option>
+            ${incomeOptions(type.id).map((t) => {
+              const w = wallet(t.walletId);
+              return html`<option value="${t.id}" ${t.id === f.incomeId ? 'selected' : ''}>${dayMonth(t.date)} · ${money(t.amount, w.currency)}${t.note ? ` · ${t.note}` : ''}</option>`;
+            })}
+          </select></label>
+        ${income && html`<label class="field"><span>Percent</span>
+            <input id="f-tax-rate" class="input" inputmode="decimal" autocomplete="off" value="${f.taxRate}" data-change="txForm"></label>
+          ${rate && html`<p class="small">Should pay about ${money(Math.round((income.amount * rate) / 100), incomeWallet.currency)}, worked out in ${type.currency} at the rate on the income date.</p>`}`}`}
+      ${seg('taxStatus', f.taxStatus, [['due', 'To pay'], ['paid', 'Paid']])}
+      ${!income && walletSelect('f-wallet', f.taxStatus === 'paid' ? 'Paid from' : 'Pay from', f.walletId, 'txForm')}
+      ${income && html`<input id="f-wallet" type="hidden" value="${f.walletId}">`}
+      ${!income && priceFields}
+      ${income && f.taxStatus === 'paid' && html`<p class="small">You'll enter what you paid on the next screen.</p>`}
+      ${footer}
+    </div>`;
+}
+
+function taxesList(list, withPay) {
+  return html`<div class="card card-flush">${list.map((tax) => taxRow(tax, withPay))}</div>`;
+}
+
+function sheetTaxes() {
+  const unpaid = C.unpaidTaxes(state);
+  const done = state.taxes
+    .filter((x) => C.taxStatus(state, x).settled)
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .slice(0, 24);
+  return html`${sheetHead('Taxes', 'Back')}
+    <div class="sheet-body">
+      <section class="month-section">
+        <h2 class="section-title">Tax to pay</h2>
+        ${unpaid.length ? taxesList(unpaid, true) : html`<p class="small">Nothing to pay right now.</p>`}
+      </section>
+      ${unpaid.length > 1 && html`<button class="btn" data-a="payAll">Pay all</button>`}
+      <button class="btn" data-a="newTaxEntry">Add a tax</button>
+      <button class="btn" data-a="openTaxTypes">Tax types</button>
+      ${done.length > 0 && html`<section class="month-section">
+        <h2 class="section-title">Paid</h2>
+        ${taxesList(done, false)}
+      </section>`}
+    </div>`;
+}
+
+const rateLine = (tax) => {
+  if (!tax.base || tax.baseCurrency === tax.currency) return null;
+  const big = tax.fx >= 1;
+  const text = `1 ${big ? tax.baseCurrency : tax.currency} = ${formatRate(big ? tax.fx : 1 / tax.fx)} ${big ? tax.currency : tax.baseCurrency}`;
+  const source = tax.fxSource === 'nbu' ? `NBU, ${dayMonth(tax.date)}` : tax.fxSource === 'manual' ? 'your rate' : 'estimate until the NBU rate is saved';
+  return `${text} (${source})`;
+};
+
+function sheetTaxItem(s) {
+  const tax = taxItem(s.id);
+  if (!tax) return html`${sheetHead('Tax', 'Back')}<div class="sheet-body"><p class="small">This tax no longer exists.</p></div>`;
+  const f = s.form;
+  const type = taxType(tax.taxTypeId);
+  const status = C.taxStatus(state, tax);
+  // The same amount in the income's currency, so it can be compared with the bank statement.
+  const equivalent = (cents) =>
+    tax.base && tax.baseCurrency !== tax.currency ? `≈ ${money(Math.round(cents / tax.fx), tax.baseCurrency)}` : '';
+  const income = tax.incomeId && state.tx.find((t) => t.id === tax.incomeId);
+  return html`${sheetHead(type.name, 'Back', 'saveTaxItem')}
+    <div class="sheet-body">
+      ${s.error && html`<p class="error">${s.error}</p>`}
+      <div class="card">
+        <div class="row-between"><span class="small">Should pay${tax.rate ? `: ${tax.rate}% of ${money(tax.base, tax.baseCurrency)}` : ''}</span></div>
+        <div class="tax-figure">${money(tax.dueAmount, tax.currency)} <span class="small">${equivalent(tax.dueAmount)}</span></div>
+        ${rateLine(tax) && html`<p class="small">${rateLine(tax)}</p>`}
+        <div class="row-between"><span class="small">Paid${status.paidPercent ? `: ${status.paidPercent.toFixed(2)}%` : ''}</span></div>
+        <div class="tax-figure">${money(status.paid, tax.currency)} <span class="small">${equivalent(status.paid)}</span></div>
+        <p class="tax-diff">${status.difference === 0
+          ? 'Paid exactly what it should be.'
+          : status.difference > 0
+            ? `${money(status.difference, tax.currency)} more than it should be${equivalent(status.difference) && ` (${equivalent(status.difference)})`}. This isn't carried over.`
+            : `${money(status.remaining, tax.currency)} still to pay${equivalent(status.remaining) && ` (${equivalent(status.remaining)})`}.`}</p>
+        <button class="btn" data-a="payTax" data-id="${tax.id}">${status.settled ? 'Add another payment' : 'Pay'}</button>
+      </div>
+      ${status.payments.length > 0 && html`<section class="month-section">
+        <h2 class="section-title">Payments</h2>
+        <div class="card card-flush">${C.sortTx(status.payments).map((p) => html`<button class="tx" data-a="editPayment" data-id="${p.id}">
+          <span class="tx-main"><div class="tx-title">${shortDate(p.date)}</div><div class="tx-sub">${wallet(p.walletId).name}${p.note ? ` · ${p.note}` : ''}</div></span>
+          <span class="tx-amount">${money(p.amount, wallet(p.walletId).currency)}
+            ${p.foreignCurrency && html`<div class="tx-sub">${money(p.foreignAmount, p.foreignCurrency)}</div>`}</span>
+        </button>`)}</div>
+      </section>`}
+      ${income && html`<button class="btn" data-a="editTx" data-id="${income.id}">Open the income (${shortDate(income.date)})</button>`}
+      ${tax.base
+        ? html`<label class="field"><span>Percent</span><input id="f-item-rate" class="input" inputmode="decimal" autocomplete="off" value="${f.rate}"></label>
+          ${tax.baseCurrency !== tax.currency && html`<label class="field"><span>Value of 1 ${tax.baseCurrency} in ${tax.currency}</span>
+            <input id="f-item-fx" class="input" inputmode="decimal" autocomplete="off" value="${f.fx}"></label>`}`
+        : html`<label class="field"><span>Should pay (${tax.currency})</span><input id="f-item-due" class="input" inputmode="decimal" autocomplete="off" value="${f.due}"></label>`}
+      ${!tax.incomeId && html`<label class="field"><span>Counts for the month of</span><input id="f-date" class="input" type="date" value="${f.date}"></label>`}
+      <label class="field"><span>Note (optional)</span><input id="f-note" class="input" maxlength="120" value="${f.note}"></label>
+      <button class="btn btn-danger" data-a="deleteTaxItem">${status.payments.length ? 'Delete tax and its payments' : 'Delete tax'}</button>
+      ${status.payments.length > 0 && html`<p class="small">Deleting its payments returns that money to the wallets.</p>`}
+    </div>`;
+}
+
+// Tax-currency units for 1 unit of the wallet's currency, or null when no rate is known.
+function taxPayFx(tax, walletId, date) {
+  const currency = wallet(walletId).currency;
+  if (currency === tax.currency) return 1;
+  if (tax.payRate) return 1 / tax.payRate;
+  return C.rateOn(state, currency, tax.currency, date)?.rate ?? null;
+}
+
+// Shows a rate the way people read it: 1 of the stronger currency equals a number above 1.
+function setFormFx(f, fx, walletCurrency, taxCurrency) {
+  f.fx = fx;
+  const strong = !fx || fx >= 1;
+  f.rateFrom = strong ? walletCurrency : taxCurrency;
+  f.rateTo = strong ? taxCurrency : walletCurrency;
+  f.rate = fx ? formatRate(strong ? fx : 1 / fx) : '';
+}
+
+const percentOfTax = (tax, cents, fx) => (tax.base && fx ? ((cents * fx) / (tax.base * tax.fx)) * 100 : null);
+
+function paySheet(tax, payment) {
+  const walletId = payment?.walletId ?? payerWallet(tax);
+  const date = payment?.date ?? today();
+  const fx = payment?.foreignCurrency ? payment.foreignAmount / payment.amount : taxPayFx(tax, walletId, date);
+  const amount = payment ? payment.amount : fx ? Math.round(C.taxStatus(state, tax).remaining / fx) : 0;
+  const pct = percentOfTax(tax, amount, fx);
+  const form = {
+    walletId,
+    date,
+    note: payment?.note ?? '',
+    amount: amount ? C.centsToInput(amount) : '',
+    percent: pct === null ? '' : pct.toFixed(2),
+    fxEdited: Boolean(payment),
+    amountEdited: Boolean(payment),
+  };
+  setFormFx(form, fx, wallet(walletId).currency, tax.currency);
+  return { type: 'taxPay', taxId: tax.id, id: payment?.id, form };
+}
+
+// Plain words for what this payment does: how it compares with what should be paid.
+function paySummary(s) {
+  const tax = taxItem(s.taxId);
+  const f = s.form;
+  const cents = Math.abs(C.parseAmount(f.amount) ?? 0);
+  if (!cents || !f.fx) return '';
+  const others = C.taxPayments(state, tax.id)
+    .filter((p) => p.id !== s.id)
+    .reduce((sum, p) => sum + C.paymentInTaxCurrency(state, p, tax), 0);
+  const counted = Math.round(cents * f.fx);
+  const difference = others + counted - tax.dueAmount;
+  const value = wallet(f.walletId).currency === tax.currency ? '' : `Counts as ${money(counted, tax.currency)}. `;
+  if (difference === 0) return `${value}That's exactly what should be paid.`;
+  return difference > 0
+    ? `${value}That's ${money(difference, tax.currency)} more than it should be.`
+    : `${value}${money(-difference, tax.currency)} will still be to pay.`;
+}
+
+function sheetTaxPay(s) {
+  const tax = taxItem(s.taxId);
+  if (!tax) return html`${sheetHead('Payment', 'Back')}<div class="sheet-body"><p class="small">This tax no longer exists.</p></div>`;
+  const f = s.form;
+  const type = taxType(tax.taxTypeId);
+  const walletCurrency = wallet(f.walletId).currency;
+  return html`${sheetHead(s.id ? 'Edit payment' : `Pay ${type.name}`, 'Cancel', 'savePayment')}
+    <div class="sheet-body">
+      <p class="small">Should pay ${money(tax.dueAmount, tax.currency)}${tax.rate ? ` (${tax.rate}%)` : ''}.</p>
+      ${s.error && html`<p class="error">${s.error}</p>`}
+      <div>
+        <input id="f-pay-amount" class="amount-input" inputmode="decimal" autocomplete="off" placeholder="0.00" aria-label="Amount in ${walletCurrency}" value="${f.amount}">
+        <p class="amount-currency">${walletCurrency}</p>
+      </div>
+      ${tax.base && html`<label class="field"><span>Percent of income</span>
+        <input id="f-pay-percent" class="input" inputmode="decimal" autocomplete="off" value="${f.percent}"></label>`}
+      ${walletSelect('f-wallet', 'Paid from', f.walletId, 'payForm')}
+      ${walletCurrency !== tax.currency && html`<label class="rate-row rate-row-plain"><span>1 ${f.rateFrom} =</span>
+          <input id="f-pay-rate" class="input" inputmode="decimal" autocomplete="off" placeholder="Enter rate" aria-label="Value of 1 ${f.rateFrom} in ${f.rateTo}" value="${f.rate}">
+          <span>${f.rateTo}</span></label>`}
+      <p class="reconcile-summary" id="pay-summary">${paySummary(s)}</p>
+      <label class="field"><span>Paid on</span><input id="f-date" class="input" type="date" data-change="payForm" value="${f.date}"></label>
+      <label class="field"><span>Note (optional)</span><input id="f-note" class="input" maxlength="120" value="${f.note}"></label>
+      ${s.id && html`<button class="btn btn-danger" data-a="deletePayment">Delete payment</button>`}
+    </div>`;
+}
+
+function sheetTaxTypes() {
+  const sorted = [...activeTaxTypes(), ...state.taxTypes.filter((x) => x.archived)];
+  return html`${sheetHead('Tax types', 'Back')}
+    <div class="sheet-body">
+      ${sorted.length
+        ? html`<div class="card card-flush">${sorted.map(
+            (x) => html`<button class="set-row" data-a="editTaxType" data-id="${x.id}">
+              <span class="budget-name">${badge(x, 'badge-small')} ${x.name}</span>
+              <span class="value">${x.archived ? 'Hidden' : x.mode === 'percent' ? `${x.rate}%` : 'Fixed'} ›</span>
+            </button>`,
+          )}</div>`
+        : html`<p class="small">A tax type is a percentage of income, or a fixed amount you owe even with no income.</p>`}
+      <button class="btn" data-a="newTaxType">Add tax type</button>
+    </div>`;
+}
+
+function sheetTaxType(s) {
+  const f = s.form;
+  const used = s.id && (state.taxes.some((x) => x.taxTypeId === s.id) || state.recurring.some((r) => r.taxTypeId === s.id));
+  return html`${sheetHead(s.id ? 'Edit tax type' : 'New tax type', 'Back', 'saveTaxType')}
+    <div class="sheet-body">
+      ${s.error && html`<p class="error">${s.error}</p>`}
+      <div class="name-row">
+        ${badge(f, 'badge-large')}
+        <label class="field"><span>Name</span><input id="f-name" class="input" maxlength="40" placeholder="Single tax" value="${f.name}"></label>
+      </div>
+      ${seg('taxMode', f.mode, [['percent', 'Percent of income'], ['fixed', 'Fixed amount']])}
+      ${f.mode === 'percent'
+        ? html`<div class="two-col">
+            <label class="field"><span>Percent</span><input id="f-type-rate" class="input" inputmode="decimal" autocomplete="off" placeholder="5" value="${f.rate}"></label>
+            <label class="field"><span>Worked out in</span><select id="f-currency" class="input">${currencyOptions(f.currency)}</select></label>
+          </div>
+          <div class="field"><span>Suggest on income in these wallets</span>
+            <div class="card card-flush">${activeWallets().map(
+              (w) => html`<label class="set-row"><span class="budget-name">${badge(w, 'badge-small')} ${w.name}</span>
+                <input type="checkbox" data-tax-wallet="${w.id}" ${f.walletIds.includes(w.id) ? 'checked' : ''}></label>`,
+            )}</div>
+          </div>`
+        : html`<p class="small">You owe this even with no income. To have it come due on a schedule, add it under Recurring and choose Tax.</p>`}
+      ${stylePicker(f)}
+      ${s.id && (used
+        ? html`<button class="btn" data-a="toggleTaxTypeHidden">${f.archived ? 'Show tax type again' : 'Hide tax type'}</button>
+          <p class="small">Hiding removes it from the picker. Its past taxes stay.</p>`
+        : html`<button class="btn btn-danger" data-a="deleteTaxType">Delete tax type</button>`)}
     </div>`;
 }
 
@@ -899,6 +1351,7 @@ function sheetRates() {
           <p class="small">Editing a rate switches to Set by me, so your number stays as you typed it.</p>`
         : html`<p class="small">All your wallets use ${state.currency}, so no rates are needed yet.</p>`}
       <p class="small"><a href="https://www.exchangerate-api.com" target="_blank" rel="noopener">Rates By Exchange Rate API</a></p>
+      <p class="small">Tax, income and spending use the official rate of the <a href="https://bank.gov.ua" target="_blank" rel="noopener">National Bank of Ukraine</a> for their date once it's saved.</p>
     </div>`;
 }
 
@@ -1011,7 +1464,7 @@ function sheetRecurring() {
     <div class="sheet-body">
       ${state.recurring.length
         ? html`<div class="card card-flush">${state.recurring.map((r) => {
-            const c = category(r.categoryId);
+            const c = r.type === 'tax' ? taxType(r.taxTypeId) : category(r.categoryId);
             const w = wallet(r.walletId);
             return html`<button class="tx" data-a="editRule" data-id="${r.id}">
               ${badge(c)}
@@ -1036,7 +1489,7 @@ function sheetRule(s) {
   const currentRate = f.foreign && C.crossRate(state, f.foreign, walletCurrency);
   return html`${sheetHead(s.id ? 'Edit recurring' : 'New recurring', 'Back', 'saveRule')}
     <div class="sheet-body">
-      ${seg('ruleType', f.type, TYPE_OPTIONS)}
+      ${seg('ruleType', f.type, RULE_TYPE_OPTIONS)}
       ${s.error && html`<p class="error">${s.error}</p>`}
       ${walletSelect('f-wallet', 'Wallet', f.walletId, 'ruleForm')}
       <label class="field"><span>Price in</span>
@@ -1054,11 +1507,19 @@ function sheetRule(s) {
           : html`<p class="small">${currentRate
               ? `Each payment uses the rate on its due date. Today: 1 ${f.foreign} = ${formatRate(currentRate)} ${walletCurrency}.`
               : `No exchange rate saved for ${f.foreign}. Connect to the internet, or choose My rate.`}</p>`}`}
-      <label class="field"><span>Category</span>
-        <select id="f-cat" class="input">${categoryChoices(f.type, f.categoryId).map(
-          (c) => html`<option value="${c.id}" ${c.id === f.categoryId ? 'selected' : ''}>${c.name}</option>`,
-        )}</select>
-      </label>
+      ${f.type === 'tax'
+        ? (fixedTaxTypes().length
+            ? html`<label class="field"><span>Tax</span>
+                <select id="f-tax-type" class="input">${fixedTaxTypes().map(
+                  (x) => html`<option value="${x.id}" ${x.id === f.taxTypeId ? 'selected' : ''}>${x.name}</option>`,
+                )}</select></label>`
+            : html`<p class="small">Add a fixed tax type first. Percentage taxes follow your income instead.</p>
+              <button class="btn" data-a="newTaxType">Add tax type</button>`)
+        : html`<label class="field"><span>Category</span>
+            <select id="f-cat" class="input">${categoryChoices(f.type, f.categoryId).map(
+              (c) => html`<option value="${c.id}" ${c.id === f.categoryId ? 'selected' : ''}>${c.name}</option>`,
+            )}</select>
+          </label>`}
       <label class="field"><span>Note (optional)</span><input id="f-note" class="input" maxlength="120" placeholder="Rent" value="${f.note}"></label>
       <div class="two-col">
         <label class="field"><span>Repeats</span>
@@ -1068,7 +1529,9 @@ function sheetRule(s) {
         </label>
         <label class="field"><span>First date</span><input id="f-date" class="input" type="date" value="${f.start}"></label>
       </div>
-      <p class="small">A first date in the past adds all the entries since then${f.foreign ? ", all at today's rate" : ''}.</p>
+      <p class="small">${f.type === 'tax'
+        ? 'Each one waits in Tax to pay, even with no income. The wallet changes only when you pay it. A first date in the past adds all of them since then.'
+        : `A first date in the past adds all the entries since then${f.foreign ? ", all at today's rate" : ''}.`}</p>
       ${s.id && html`<button class="btn btn-danger" data-a="deleteRule">Stop repeating</button>
         <p class="small">Entries already added stay in your history.</p>`}
     </div>`;
@@ -1078,7 +1541,7 @@ const DATE_FORMATS = { ymd: 'Year-Month-Day', dmy: 'Day-Month-Year', mdy: 'Month
 
 // What an import would add, after the choice about anything already in the app.
 function importPlan(s) {
-  const result = C.buildImport(s.rows, s.map, s.fmt, state.categories, state.wallets, s.walletId);
+  const result = C.liftImportedTaxes(state, C.buildImport(s.rows, s.map, s.fmt, state.categories, state.wallets, s.walletId));
   const repeats = C.findRepeats(state, result);
   return {
     result,
@@ -1148,7 +1611,7 @@ function sheetImport(s) {
         ${openings.length > 0 && html`<p class="small">Starting balances set for ${openings.length} ${openings.length === 1 ? 'wallet' : 'wallets'}.</p>`}
         ${visibleNewWallets.length > 0 && html`<p class="small">New wallets: ${visibleNewWallets.map((w) => `${w.name} (${w.currency})`).join(', ')}</p>`}
         ${result.newCategories.length > 0 && html`<p class="small">New categories: ${result.newCategories.map((c) => c.name).join(', ')}</p>`}
-        <div class="preview">${tx.filter((t) => t.type !== 'transfer').slice(0, 4).map((t) => {
+        <div class="preview">${tx.filter((t) => t.categoryId).slice(0, 4).map((t) => {
           const name = allCategories.find((c) => c.id === t.categoryId).name;
           const w = allWallets.find((x) => x.id === t.walletId);
           return html`<div><span>${shortDate(t.date)} · ${name}${t.note ? ` · ${t.note}` : ''}</span>
@@ -1171,6 +1634,11 @@ const SHEETS = {
   recurring: sheetRecurring,
   rule: sheetRule,
   import: sheetImport,
+  taxes: sheetTaxes,
+  tax: sheetTaxItem,
+  taxPay: sheetTaxPay,
+  taxTypes: sheetTaxTypes,
+  taxType: sheetTaxType,
 };
 
 // ---------- Rendering ----------
@@ -1213,7 +1681,9 @@ function keepFormValues() {
   const type = ui.sheet?.type;
   if (type === 'tx') readTxForm();
   if (type === 'rule') readRuleForm();
-  if (type === 'category' || type === 'wallet') readStyleForm();
+  if (type === 'category' || type === 'wallet' || type === 'taxType') readStyleForm();
+  if (type === 'taxPay') readPayForm();
+  if (type === 'tax') readTaxItemForm();
   if (type === 'reconcile') {
     ui.sheet.date = $('f-date').value;
     ui.sheet.note = $('f-note').value;
@@ -1309,10 +1779,51 @@ async function refreshRates({ force = false } = {}) {
   return true;
 }
 
+// The currencies worth keeping an official rate for.
+function rateCodes() {
+  return [...new Set([
+    ...COMMON_CURRENCIES,
+    state.currency,
+    ...state.wallets.map((w) => w.currency),
+    ...state.taxTypes.map((x) => x.currency),
+    ...state.recurring.map((r) => r.foreignCurrency).filter(Boolean),
+  ])];
+}
+
+async function fetchOfficialRates(date) {
+  if (date > today() || state.nbu[date]) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RATES_TIMEOUT_MS);
+  try {
+    const response = await fetch(C.nbuUrl(date), { signal: controller.signal });
+    const rows = await response.json();
+    return Array.isArray(rows) && C.applyNbuRates(state, date, rows, rateCodes());
+  } catch {
+    return false; // Offline: the date stays pending and is tried again later.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Fills in every date still waiting for an official rate. Today's is kept ready for paying a tax.
+async function refreshOfficialRates() {
+  if (state.taxes.length) C.needRate(state, today());
+  let changed = false;
+  for (const date of [...state.pendingRates]) {
+    if (date > today()) continue;
+    if (!(await fetchOfficialRates(date))) break;
+    changed = true;
+  }
+  if (!changed) return;
+  save();
+  if (!ui.sheet) render();
+}
+
 // Rates come first so that recurring items priced in another currency use today's rate.
 async function catchUp({ quiet = false } = {}) {
   await refreshRates();
   const added = runRecurring();
+  await refreshOfficialRates();
   if (!added) return;
   // Redrawing an open form would throw away what is being typed. It shows at the next redraw.
   if (!ui.sheet) render();
@@ -1388,8 +1899,14 @@ function startRestore(text) {
 
 function readTxForm() {
   const f = ui.sheet.form;
-  f.amount = $('f-amount').value;
+  if ($('f-amount')) f.amount = $('f-amount').value;
   f.walletId = $('f-wallet').value;
+  if ($('f-income')) f.incomeId = $('f-income').value;
+  if ($('f-tax-rate')) f.taxRate = $('f-tax-rate').value;
+  document.querySelectorAll('[data-tax-on]').forEach((box) => {
+    const id = box.dataset.taxOn;
+    f.taxes = { ...f.taxes, [id]: { on: box.checked, rate: document.querySelector(`[data-tax-rate="${id}"]`).value } };
+  });
   f.date = $('f-date').value;
   f.note = $('f-note').value;
   if ($('f-to')) f.toWalletId = $('f-to').value;
@@ -1419,7 +1936,8 @@ function readRuleForm() {
   const f = ui.sheet.form;
   f.walletId = $('f-wallet').value;
   f.amount = $('f-amount').value;
-  f.categoryId = $('f-cat').value;
+  if ($('f-cat')) f.categoryId = $('f-cat').value;
+  if ($('f-tax-type')) f.taxTypeId = $('f-tax-type').value;
   f.note = $('f-note').value;
   f.freq = $('f-freq').value;
   f.start = $('f-date').value;
@@ -1434,6 +1952,95 @@ function readStyleForm() {
   if ($('f-limit')) f.limit = $('f-limit').value;
   if ($('f-currency')) f.currency = $('f-currency').value;
   if ($('f-opening')) f.opening = $('f-opening').value;
+  if ($('f-type-rate')) f.rate = $('f-type-rate').value;
+  document.querySelectorAll('[data-tax-wallet]').forEach((box) => {
+    const others = f.walletIds.filter((id) => id !== box.dataset.taxWallet);
+    f.walletIds = box.checked ? [...others, box.dataset.taxWallet] : others;
+  });
+}
+
+function readPayForm() {
+  const s = ui.sheet;
+  const f = s.form;
+  f.amount = $('f-pay-amount').value;
+  if ($('f-pay-percent')) f.percent = $('f-pay-percent').value;
+  f.walletId = $('f-wallet').value;
+  f.date = $('f-date').value;
+  f.note = $('f-note').value;
+  const rateInput = $('f-pay-rate');
+  if (rateInput) {
+    f.rate = rateInput.value;
+    const rate = C.parseRate(f.rate);
+    f.fx = rate ? (f.rateFrom === wallet(f.walletId).currency ? rate : 1 / rate) : null;
+  }
+}
+
+function readTaxItemForm() {
+  const f = ui.sheet.form;
+  if ($('f-item-rate')) f.rate = $('f-item-rate').value;
+  if ($('f-item-fx')) f.fx = $('f-item-fx').value;
+  if ($('f-item-due')) f.due = $('f-item-due').value;
+  if ($('f-date')) f.date = $('f-date').value;
+  f.note = $('f-note').value;
+}
+
+function saveTaxEntry() {
+  const s = ui.sheet;
+  const f = s.form;
+  const type = taxType(f.taxTypeId);
+  const income = type?.mode === 'percent' && f.incomeId ? state.tx.find((t) => t.id === f.incomeId) : null;
+  const rate = C.parseRate(f.taxRate);
+  const entered = Math.abs(C.parseAmount(f.amount) ?? 0);
+  const walletCurrency = wallet(f.walletId).currency;
+  const foreign = f.foreign && f.foreign !== walletCurrency ? f.foreign : null;
+  const charged = foreign ? Math.abs(C.parseAmount(f.charged) ?? 0) : entered;
+  if (!type) s.error = 'Pick a tax.';
+  else if (income && !rate) s.error = 'Enter the percent.';
+  else if (!income && !entered) s.error = 'Enter an amount.';
+  else if (!income && f.taxStatus === 'paid' && !charged) s.error = `Enter the amount in ${walletCurrency}.`;
+  else if (!f.date) s.error = 'Pick a date.';
+  else s.error = null;
+  if (s.error) {
+    render();
+    return;
+  }
+  const before = snapshot();
+  if (income) {
+    const tax = C.addIncomeTax(state, income, type.id, rate);
+    tax.note = f.note.trim();
+    save();
+    refreshOfficialRates();
+    if (f.taxStatus === 'paid') {
+      // Same place in the history as this form, so Cancel returns to where the form was opened from.
+      ui.sheet = paySheet(tax);
+      render();
+      $('sheet').scrollTop = 0;
+      return;
+    }
+    goBack();
+    toast(`Added ${money(tax.dueAmount, tax.currency)} to Tax to pay.`, before);
+    return;
+  }
+  const tax = {
+    id: C.uid(),
+    taxTypeId: type.id,
+    date: f.date,
+    dueAmount: entered,
+    currency: foreign || walletCurrency,
+    walletId: f.walletId,
+    note: f.note.trim(),
+  };
+  state.taxes.push(tax);
+  if (f.taxStatus === 'paid') {
+    C.addTaxPayment(state, tax, { walletId: f.walletId, amount: charged, taxAmount: entered, date: f.date, note: f.note.trim() });
+  }
+  state.lastWalletId = f.walletId;
+  if (walletCurrency !== state.currency) C.needRate(state, f.date);
+  save();
+  refreshOfficialRates();
+  ui.month = C.monthOf(f.date);
+  goBack();
+  toast(f.taxStatus === 'paid' ? `Paid ${money(charged, walletCurrency)}.` : `Added ${money(entered, tax.currency)} to Tax to pay.`, before);
 }
 
 const openCategoryList = (kind = 'expense') => openSheet({ type: 'categories', kind });
@@ -1442,9 +2049,9 @@ function openTxForm(type) {
   const walletId = defaultWalletId();
   openSheet({
     type: 'tx',
-    form: { type, amount: '', walletId, toWalletId: otherWallet(walletId), toAmount: '', toEdited: false, foreign: '', charged: '', chargedEdited: false, categoryId: null, date: today(), note: '' },
+    form: { type, amount: '', walletId, toWalletId: otherWallet(walletId), toAmount: '', toEdited: false, foreign: '', charged: '', chargedEdited: false, categoryId: null, date: today(), note: '', taxStatus: 'due', taxTypeId: null, incomeId: '', taxRate: '' },
   });
-  $('f-amount').focus();
+  $('f-amount')?.focus();
 }
 
 const actions = {
@@ -1511,6 +2118,7 @@ const actions = {
   },
   editTx({ id }) {
     const t = state.tx.find((x) => x.id === id);
+    if (!t) return;
     openSheet({
       type: 'tx',
       id,
@@ -1535,7 +2143,11 @@ const actions = {
     const f = ui.sheet.form;
     if (f.type !== v) f.categoryId = null;
     f.type = v;
-    if (v === 'transfer') {
+    if (v === 'tax') {
+      f.taxTypeId = f.taxTypeId || activeTaxTypes()[0]?.id || null;
+      f.taxRate = String(taxType(f.taxTypeId)?.rate ?? '');
+      fillCharged(f);
+    } else if (v === 'transfer') {
       f.foreign = '';
       fillReceived(f);
     } else {
@@ -1548,6 +2160,19 @@ const actions = {
     ui.sheet.allCategories = true;
     render();
   },
+  txTaxType({ id }) {
+    readTxForm();
+    const f = ui.sheet.form;
+    f.taxTypeId = id;
+    f.incomeId = '';
+    f.taxRate = String(taxType(id).rate ?? '');
+    render();
+  },
+  taxStatus({ v }) {
+    readTxForm();
+    ui.sheet.form.taxStatus = v;
+    render();
+  },
   txCat({ id }, el) {
     ui.sheet.form.categoryId = id;
     el.parentElement.querySelectorAll('.cat').forEach((c) => c.setAttribute('aria-pressed', String(c === el)));
@@ -1556,6 +2181,10 @@ const actions = {
     readTxForm();
     const s = ui.sheet;
     const f = s.form;
+    if (f.type === 'tax') {
+      saveTaxEntry();
+      return;
+    }
     const entered = Math.abs(C.parseAmount(f.amount) ?? 0);
     const isTransfer = f.type === 'transfer';
     const foreign = !isTransfer && f.foreign && f.foreign !== wallet(f.walletId).currency ? f.foreign : null;
@@ -1572,6 +2201,9 @@ const actions = {
     else if (!isTransfer && !f.categoryId) s.error = 'Pick a category.';
     else if (!f.date) s.error = 'Pick a date.';
     else s.error = null;
+    const taxRows = f.type === 'income' ? incomeTaxRows(s) : [];
+    const badTax = taxRows.find((x) => x.on && !C.parseRate(x.rate));
+    if (!s.error && badTax) s.error = `Enter the percent for ${badTax.type.name}.`;
     if (s.error) {
       render();
       return;
@@ -1592,21 +2224,231 @@ const actions = {
     };
     if (existing) state.tx[state.tx.indexOf(existing)] = entry;
     else state.tx.push(entry);
+    const taxesBefore = state.taxes.length;
+    if (f.type === 'income') {
+      C.syncIncomeTaxes(state, entry, Object.fromEntries(taxRows.map((x) => [x.type.id, x.on ? C.parseRate(x.rate) : null])));
+    } else if (existing?.type === 'income') {
+      C.detachIncomeTaxes(state, entry.id, false);
+    }
+    if (!isTransfer && wallet(f.walletId).currency !== state.currency) C.needRate(state, f.date);
     state.lastWalletId = f.walletId;
     save();
+    refreshOfficialRates();
     ui.month = C.monthOf(f.date);
     goBack();
     const shown = money(amount, wallet(f.walletId).currency);
     const later = f.date > today() ? ` Your balance changes on ${shortDate(f.date)}.` : '';
-    if (s.id) toast(`Entry updated.${later}`);
-    else toast(`${isTransfer ? `Moved ${shown} to ${to.name}.` : `Added ${shown}.`}${later}`);
+    const added = state.taxes.length - taxesBefore;
+    const taxNote = added > 0 ? ` ${added} ${added === 1 ? 'tax' : 'taxes'} added to Tax to pay.` : '';
+    if (s.id) toast(`Entry updated.${taxNote}${later}`);
+    else toast(`${isTransfer ? `Moved ${shown} to ${to.name}.` : `Added ${shown}.`}${taxNote}${later}`);
   },
   deleteTx() {
+    if (state.taxes.some((x) => x.incomeId === ui.sheet.id)) {
+      readTxForm();
+      ui.sheet.confirmDelete = true;
+      render();
+      return;
+    }
     const before = snapshot();
     state.tx = state.tx.filter((t) => t.id !== ui.sheet.id);
     save();
     goBack();
     toast('Entry deleted.', before);
+  },
+  cancelDelete() {
+    readTxForm();
+    ui.sheet.confirmDelete = false;
+    render();
+  },
+  deleteIncome({ keep }) {
+    const before = snapshot();
+    C.detachIncomeTaxes(state, ui.sheet.id, Boolean(keep));
+    state.tx = state.tx.filter((t) => t.id !== ui.sheet.id);
+    save();
+    goBack();
+    toast('Income deleted.', before);
+  },
+
+  // Tax
+  dismissUpgrade() {
+    delete state.upgradeNotice;
+    save();
+    render();
+  },
+  async saveBeforeTaxCopy() {
+    await deliverFile(`budget-before-tax-update-${today()}.json`, 'application/json', localStorage.getItem(BEFORE_TAX_KEY));
+  },
+  openTaxes() {
+    openSheet({ type: 'taxes' });
+  },
+  newTaxEntry() {
+    openTxForm('expense');
+    actions.txType({ v: 'tax' });
+  },
+  openTax({ id }) {
+    const tax = taxItem(id);
+    openSheet({
+      type: 'tax',
+      id,
+      form: {
+        rate: String(tax.rate ?? ''),
+        fx: tax.fx ? formatRate(tax.fx) : '',
+        due: C.centsToInput(tax.dueAmount),
+        date: tax.date,
+        note: tax.note || '',
+      },
+    });
+  },
+  saveTaxItem() {
+    readTaxItemForm();
+    const s = ui.sheet;
+    const f = s.form;
+    const tax = taxItem(s.id);
+    const rate = C.parseRate(f.rate);
+    const fx = C.parseRate(f.fx);
+    const due = Math.abs(C.parseAmount(f.due) ?? 0);
+    if (tax.base && !rate) s.error = 'Enter the percent.';
+    else if (tax.base && tax.baseCurrency !== tax.currency && !fx) s.error = 'Enter the exchange rate.';
+    else if (!tax.base && !due) s.error = 'Enter what should be paid.';
+    else if (!f.date) s.error = 'Pick a date.';
+    else s.error = null;
+    if (s.error) {
+      render();
+      return;
+    }
+    tax.note = f.note.trim();
+    if (!tax.incomeId) tax.date = f.date;
+    if (tax.base) {
+      tax.rate = rate;
+      // Only a rate that was really changed counts as typed by hand.
+      if (fx && tax.baseCurrency !== tax.currency && f.fx !== formatRate(tax.fx)) {
+        tax.fx = fx;
+        tax.fxSource = 'manual';
+      }
+      C.setIncomeTaxDue(state, tax);
+    } else {
+      tax.dueAmount = due;
+    }
+    save();
+    goBack();
+  },
+  deleteTaxItem() {
+    const id = ui.sheet.id;
+    const before = snapshot();
+    state.tx = state.tx.filter((t) => t.taxId !== id);
+    state.taxes = state.taxes.filter((x) => x.id !== id);
+    save();
+    goBack();
+    toast('Tax deleted.', before);
+  },
+  payTax({ id }) {
+    openSheet(paySheet(taxItem(id)));
+    $('f-pay-amount').focus();
+  },
+  editPayment({ id }) {
+    const payment = state.tx.find((t) => t.id === id);
+    openSheet(paySheet(taxItem(payment.taxId), payment));
+  },
+  savePayment() {
+    readPayForm();
+    const s = ui.sheet;
+    const f = s.form;
+    const tax = taxItem(s.taxId);
+    const amount = Math.abs(C.parseAmount(f.amount) ?? 0);
+    if (!amount) s.error = 'Enter what you paid.';
+    else if (!f.fx) s.error = 'Enter the exchange rate.';
+    else if (!f.date) s.error = 'Pick a date.';
+    else s.error = null;
+    if (s.error) {
+      render();
+      return;
+    }
+    const before = snapshot();
+    const details = { walletId: f.walletId, amount, taxAmount: Math.round(amount * f.fx), date: f.date, note: f.note.trim() };
+    if (s.id) state.tx = state.tx.filter((t) => t.id !== s.id);
+    const payment = C.addTaxPayment(state, tax, details);
+    if (s.id) payment.id = s.id;
+    if (wallet(f.walletId).currency !== state.currency) C.needRate(state, f.date);
+    state.lastWalletId = f.walletId;
+    save();
+    refreshOfficialRates();
+    goBack();
+    const later = f.date > today() ? ` Your balance changes on ${shortDate(f.date)}.` : '';
+    toast(`${s.id ? 'Payment updated' : `Paid ${money(amount, wallet(f.walletId).currency)}`}.${later}`, before);
+  },
+  deletePayment() {
+    const id = ui.sheet.id;
+    const before = snapshot();
+    state.tx = state.tx.filter((t) => t.id !== id);
+    save();
+    goBack();
+    toast('Payment deleted. The money is back in the wallet.', before);
+  },
+  payAll() {
+    const count = C.unpaidTaxes(state).length;
+    if (!confirm(`Pay all ${count} taxes today? Each pays what's left from its usual wallet, at today's rate.`)) return;
+    const before = snapshot();
+    const paid = C.payAllTaxes(state, today(), payerWallet);
+    save();
+    render();
+    toast(`Paid ${paid} ${paid === 1 ? 'tax' : 'taxes'}.`, before);
+  },
+  openTaxTypes() {
+    openSheet({ type: 'taxTypes' });
+  },
+  newTaxType() {
+    openSheet({
+      type: 'taxType',
+      form: { icon: 'badge-percent', color: C.nextColor(state.taxTypes), name: '', mode: 'percent', rate: '', currency: state.currency, walletIds: [], archived: false },
+    });
+  },
+  editTaxType({ id }) {
+    const x = taxType(id);
+    openSheet({
+      type: 'taxType',
+      id,
+      form: { icon: x.icon, color: x.color, name: x.name, mode: x.mode, rate: x.rate ? String(x.rate) : '', currency: x.currency, walletIds: [...x.walletIds], archived: x.archived },
+    });
+  },
+  taxMode({ v }) {
+    readStyleForm();
+    ui.sheet.form.mode = v;
+    render();
+  },
+  saveTaxType() {
+    readStyleForm();
+    const s = ui.sheet;
+    const f = s.form;
+    const name = f.name.trim();
+    const rate = f.mode === 'percent' ? C.parseRate(f.rate) : null;
+    if (!name) s.error = 'Enter a name.';
+    else if (f.mode === 'percent' && !rate) s.error = 'Enter the percent.';
+    else if (state.taxTypes.some((x) => x.id !== s.id && x.name.toLowerCase() === name.toLowerCase())) {
+      s.error = 'A tax type with this name already exists.';
+    } else s.error = null;
+    if (s.error) {
+      render();
+      return;
+    }
+    const data = { name, icon: f.icon, color: f.color, mode: f.mode, rate, currency: f.currency, walletIds: f.mode === 'percent' ? f.walletIds : [], archived: f.archived };
+    if (s.id) Object.assign(taxType(s.id), data);
+    else state.taxTypes.push({ id: C.uid(), ...data });
+    save();
+    goBack();
+  },
+  toggleTaxTypeHidden() {
+    const x = taxType(ui.sheet.id);
+    x.archived = !x.archived;
+    save();
+    goBack();
+  },
+  deleteTaxType() {
+    const before = snapshot();
+    state.taxTypes = state.taxTypes.filter((x) => x.id !== ui.sheet.id);
+    save();
+    goBack();
+    toast('Tax type deleted.', before);
   },
 
   pickPreset({ name, icon, color }) {
@@ -1746,6 +2588,7 @@ const actions = {
     }
     const before = snapshot();
     state.wallets = state.wallets.filter((w) => w.id !== s.id);
+    for (const x of state.taxTypes) x.walletIds = x.walletIds.filter((id) => id !== s.id);
     save();
     goBack();
     toast('Wallet deleted.', before);
@@ -1841,6 +2684,7 @@ const actions = {
         rateMode: 'current',
         rate: '',
         categoryId: activeCategories('expense')[0]?.id,
+        taxTypeId: fixedTaxTypes()[0]?.id,
         note: '',
         freq: 'monthly',
         start: today(),
@@ -1856,7 +2700,7 @@ const actions = {
         foreign: r.foreignCurrency || '',
         rateMode: r.fixedRate ? 'fixed' : 'current',
         rate: r.fixedRate ? formatRate(r.fixedRate) : '',
-        type: r.type, walletId: r.walletId, amount: C.centsToInput(r.foreignCurrency ? r.foreignAmount : r.amount), categoryId: r.categoryId, note: r.note, freq: r.freq, start: r.start,
+        type: r.type, walletId: r.walletId, amount: C.centsToInput(r.foreignCurrency ? r.foreignAmount : r.amount), categoryId: r.categoryId, taxTypeId: r.taxTypeId ?? fixedTaxTypes()[0]?.id, note: r.note, freq: r.freq, start: r.start,
       },
     });
   },
@@ -1871,7 +2715,7 @@ const actions = {
   ruleType({ v }) {
     readRuleForm();
     const f = ui.sheet.form;
-    if (f.type !== v) f.categoryId = activeCategories(v)[0]?.id;
+    if (f.type !== v && v !== 'tax') f.categoryId = activeCategories(v)[0]?.id;
     f.type = v;
     render();
   },
@@ -1887,7 +2731,8 @@ const actions = {
     if (!entered) s.error = 'Enter an amount.';
     else if (foreign && f.rateMode === 'fixed' && !fixedRate) s.error = 'Enter your exchange rate.';
     else if (!rate) s.error = `No exchange rate saved for ${foreign}. Choose My rate and enter one.`;
-    else if (!f.categoryId) s.error = 'Pick a category.';
+    else if (f.type === 'tax' && !taxType(f.taxTypeId)) s.error = 'Pick a tax.';
+    else if (f.type !== 'tax' && !f.categoryId) s.error = 'Pick a category.';
     else if (!f.start) s.error = 'Pick a first date.';
     else s.error = null;
     if (s.error) {
@@ -1901,7 +2746,8 @@ const actions = {
       foreignAmount: foreign ? entered : undefined,
       foreignCurrency: foreign || undefined,
       fixedRate: fixedRate || undefined,
-      categoryId: f.categoryId,
+      categoryId: f.type === 'tax' ? undefined : f.categoryId,
+      taxTypeId: f.type === 'tax' ? f.taxTypeId : undefined,
       note: f.note.trim(),
       freq: f.freq,
       start: f.start,
@@ -1940,8 +2786,11 @@ const actions = {
   confirmImport() {
     const s = ui.sheet;
     const before = snapshot();
-    const { result: { newCategories, newWallets }, tx, openings } = importPlan(s);
+    const { result: { newCategories, newWallets, newTaxTypes, taxes }, tx, openings } = importPlan(s);
+    const kept = new Set(tx.map((t) => t.taxId));
     state.categories.push(...newCategories);
+    state.taxTypes.push(...newTaxTypes);
+    state.taxes.push(...taxes.filter((x) => kept.has(x.id)));
     state.wallets.push(...newWallets);
     state.tx.push(...tx);
     for (const [id, cents] of openings) wallet(id).opening += cents;
@@ -2000,6 +2849,30 @@ const changes = {
     f.chargedEdited = false;
     fillCharged(f);
     render();
+  },
+  payForm() {
+    readPayForm();
+    const s = ui.sheet;
+    const f = s.form;
+    const tax = taxItem(s.taxId);
+    const walletCurrency = wallet(f.walletId).currency;
+    const redo = () => {
+      if (!f.fxEdited) setFormFx(f, taxPayFx(tax, f.walletId, f.date), walletCurrency, tax.currency);
+      if (!f.amountEdited && f.fx) f.amount = C.centsToInput(Math.round(C.taxStatus(state, tax).remaining / f.fx));
+      const pct = percentOfTax(tax, Math.abs(C.parseAmount(f.amount) ?? 0), f.fx);
+      f.percent = pct === null ? '' : pct.toFixed(2);
+      render();
+    };
+    redo();
+    // Rates for a date not seen yet arrive a moment later. An open form only updates if it's still this one.
+    fetchOfficialRates(f.date).then((changed) => {
+      if (!changed) return;
+      save();
+      if (ui.sheet === s) {
+        readPayForm();
+        redo();
+      }
+    });
   },
   ruleForm() {
     readRuleForm();
@@ -2062,6 +2935,34 @@ document.addEventListener('input', (e) => {
     return;
   }
   const form = ui.sheet?.form;
+  if (ui.sheet?.type === 'taxPay' && e.target.id?.startsWith('f-pay-')) {
+    const tax = taxItem(ui.sheet.taxId);
+    readPayForm();
+    if (e.target.id === 'f-pay-rate') form.fxEdited = true;
+    if (e.target.id !== 'f-pay-rate') form.amountEdited = true;
+    if (e.target.id === 'f-pay-percent') {
+      const pct = C.parseRate(form.percent);
+      if (pct && form.fx) {
+        form.amount = C.centsToInput(Math.round(((tax.base * tax.fx * pct) / 100) / form.fx));
+        $('f-pay-amount').value = form.amount;
+      }
+    } else if ($('f-pay-percent')) {
+      const pct = percentOfTax(tax, Math.abs(C.parseAmount(form.amount) ?? 0), form.fx);
+      form.percent = pct === null ? '' : pct.toFixed(2);
+      $('f-pay-percent').value = form.percent;
+    }
+    $('pay-summary').textContent = paySummary(ui.sheet);
+    return;
+  }
+  if (e.target.dataset?.taxRate || e.target.id === 'f-amount' || e.target.id === 'f-charged') {
+    if (form && ui.sheet.type === 'tx' && form.type === 'income') {
+      if ($('f-amount')) form.amount = $('f-amount').value;
+      if ($('f-charged')) form.charged = $('f-charged').value;
+      queueMicrotask(() => document.querySelectorAll('[data-tax-rate]').forEach((input) => {
+        document.querySelector(`[data-tax-amount="${input.dataset.taxRate}"]`).textContent = taxPreview(form, input.value);
+      }));
+    }
+  }
   if (form && e.target.id === 'f-to-amount') form.toEdited = true;
   if (form && e.target.id === 'f-charged') form.chargedEdited = true;
   if (form && e.target.id === 'f-amount' && $('f-charged')) {

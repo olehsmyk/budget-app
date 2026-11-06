@@ -11,6 +11,7 @@
   --accent-ink: #1c5cab;
   --income: #2a78d6;
   --expense: #eb6834;
+  --tax: #a12d9c;
   --good: #006300;
   --critical: #d03b3b;
   --chip: #f0efec;
@@ -29,6 +30,7 @@
     --accent-ink: #6da7ec;
     --income: #3987e5;
     --expense: #d95926;
+    --tax: #b84bb3;
     --good: #0ca30c;
     --critical: #e66767;
     --chip: #2c2c2a;
@@ -46,6 +48,7 @@
   --accent-ink: #6da7ec;
   --income: #3987e5;
   --expense: #d95926;
+  --tax: #b84bb3;
   --good: #0ca30c;
   --critical: #e66767;
   --chip: #2c2c2a;
@@ -560,6 +563,8 @@ a { color: var(--accent-ink); }
 .chart .grid { stroke: var(--line); stroke-width: 1; }
 .chart .income { fill: var(--income); }
 .chart .expense { fill: var(--expense); }
+.chart .tax { fill: var(--tax); }
+.chart .tax.later { opacity: 0.45; }
 .chart .planned { opacity: 0.45; }
 .chart .hit { fill: transparent; }
 .chart .hit.selected { fill: var(--chip); }
@@ -569,6 +574,50 @@ details summary { color: var(--accent-ink); font-size: 14px; font-weight: 500; m
 .table th { font-weight: 600; color: var(--muted); border-top: 0; }
 .table th:first-child, .table td:first-child { text-align: left; }
 .table td { font-variant-numeric: tabular-nums; }
+
+/* ---------- Tax ---------- */
+.stat-link { display: block; width: 100%; }
+.tax-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 0 0;
+  border-top: 1px solid var(--line);
+}
+.tax-row { display: flex; align-items: center; min-width: 0; padding-right: 12px; }
+.tax-row .tx { flex: 1; min-width: 0; padding-right: 8px; }
+.tax-row .tx-title, .tax-row .tx-sub { white-space: normal; }
+.pay-btn {
+  flex: none;
+  min-width: 52px;
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: 10px;
+  background: var(--chip);
+  color: var(--accent-ink);
+  text-align: center;
+  font-size: 14px;
+  font-weight: 600;
+}
+.btn-links { display: flex; gap: 16px; }
+.tax-figure { font-size: 22px; font-weight: 700; margin-top: -8px; overflow-wrap: anywhere; }
+.tax-figure .small { font-weight: 400; }
+.tax-diff { font-size: 14px; font-weight: 500; color: var(--ink-2); }
+.tax-check {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 84px;
+  align-items: center;
+  gap: 4px 8px;
+}
+.tax-check-name { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; min-width: 0; font-weight: 500; }
+.tax-check-name input { flex: none; width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
+.tax-check-rate { display: flex; align-items: center; gap: 4px; }
+.tax-check-rate .input { min-width: 0; text-align: right; padding-inline: 8px; }
+.tax-check-amount { grid-column: 1 / -1; padding-left: 28px; }
+.tax-check-amount:empty { display: none; }
 
 /* ---------- Toast ---------- */
 #toast {

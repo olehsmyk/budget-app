@@ -69,6 +69,9 @@ const DEFAULT_CATEGORIES = [
   ['Savings', 'piggy-bank', 'magenta', 'income'],
   ['Gifts', 'gift', 'red', 'income'],
   ['Loans', 'hand-coins', 'orange', 'income'],
+  // Added in version 4.
+  ['Fees', 'receipt', 'brown', 'expense'],
+  ['Tax refund', 'badge-percent', 'teal', 'income'],
 ];
 
 const defaultCategory = ([name, icon, color, kind], i) => ({
@@ -78,7 +81,8 @@ const defaultCategory = ([name, icon, color, kind], i) => ({
   color,
   kind,
   limit: null,
-  archived: false,
+  // Tax has its own type of entry now. The category stays so older files can still be read.
+  archived: name === 'Taxes',
 });
 
 // Ready-made starting points on the new wallet form.
@@ -96,7 +100,7 @@ export const WALLET_PRESETS = [
 export function defaultState(nowISO) {
   return {
     app: 'budget',
-    version: 3,
+    version: 4,
     // The currency totals, charts and budget limits are shown in.
     currency: 'USD',
     // How much 1 unit of each other currency is worth in `currency`.
@@ -110,6 +114,13 @@ export function defaultState(nowISO) {
     categories: DEFAULT_CATEGORIES.map(defaultCategory),
     tx: [],
     recurring: [],
+    taxTypes: [],
+    // What should be paid. The money paid is in `tx`, as entries of type `tax` that point to one of these.
+    taxes: [],
+    // Official NBU rates by date: units of UAH for 1 unit of each currency.
+    nbu: {},
+    // Dates that still need an NBU rate, because the app was offline or the date hasn't come yet.
+    pendingRates: [],
   };
 }
 
@@ -151,6 +162,113 @@ function migrateV2(o) {
   return { ...o, version: 3, categories: [...o.categories, ...added] };
 }
 
+const isTaxesCategory = (c) => c.kind === 'expense' && c.name.toLowerCase() === 'taxes';
+const FEE_NOTE = /\bfees?\b|комісі/i;
+
+// Taxes these notes usually mean, so an upgrade or import starts with sensible settings.
+const KNOWN_TAX_TYPES = new Map([
+  ['єсв', { icon: 'landmark', mode: 'fixed', rate: null }],
+  ['єп', { icon: 'badge-percent', mode: 'percent', rate: 5 }],
+  ['військовий збір', { icon: 'hand-coins', mode: 'percent', rate: 1 }],
+]);
+
+function taxTypeNamed(data, name, walletId) {
+  const found = data.taxTypes.find((x) => x.name.toLowerCase() === name.toLowerCase());
+  if (found) return found;
+  const known = KNOWN_TAX_TYPES.get(name.toLowerCase());
+  const walletCurrency = data.wallets.find((w) => w.id === walletId)?.currency;
+  const type = {
+    id: uid(),
+    name,
+    icon: known?.icon ?? 'badge-percent',
+    color: nextColor(data.taxTypes),
+    mode: known?.mode ?? 'fixed',
+    rate: known?.rate ?? null,
+    currency: known ? 'UAH' : walletCurrency,
+    walletIds: known?.mode === 'percent' ? [walletId] : [],
+    archived: false,
+  };
+  data.taxTypes.push(type);
+  return type;
+}
+
+function feesCategory(data) {
+  let fees = data.categories.find((c) => c.kind === 'expense' && c.name.toLowerCase() === 'fees');
+  if (!fees) {
+    fees = { id: uid(), name: 'Fees', icon: 'receipt', color: 'brown', kind: 'expense', limit: null, archived: false };
+    data.categories.push(fees);
+  }
+  return fees;
+}
+
+// Turns entries in the old Taxes category into paid taxes, and fees into Fees. An entry with no note
+// counts as a fee in a wallet that has other fees: real taxes there would be named like the rest.
+// A second payment of one tax on one day was paying a month that got missed, so it counts for that month.
+function liftTaxEntries(data, list) {
+  const old = data.categories.find(isTaxesCategory);
+  const counts = { taxes: 0, fees: 0 };
+  if (!old) return counts;
+  old.archived = true;
+  const entries = list.filter((t) => t.categoryId === old.id).sort((a, b) => a.date.localeCompare(b.date));
+  const feeWallets = new Set(entries.filter((t) => FEE_NOTE.test(t.note || '')).map((t) => t.walletId));
+  const used = new Set();
+  for (const t of entries) {
+    if (!t.taxName && (FEE_NOTE.test(t.note || '') || (!t.note && feeWallets.has(t.walletId)))) {
+      t.categoryId = feesCategory(data).id;
+      counts.fees++;
+      continue;
+    }
+    const type = taxTypeNamed(data, t.taxName || t.note || 'Other tax', t.walletId);
+    delete t.taxName;
+    let date = t.date;
+    while (used.has(`${type.id}|${date}`)) date = occurrence(date, 'monthly', -1);
+    used.add(`${type.id}|${date}`);
+    const currency = data.wallets.find((w) => w.id === t.walletId).currency;
+    const tax = { id: uid(), taxTypeId: type.id, date, dueAmount: t.amount, currency, walletId: t.walletId, note: '' };
+    data.taxes.push(tax);
+    t.type = 'tax';
+    t.taxId = tax.id;
+    delete t.categoryId;
+    counts.taxes++;
+  }
+  return counts;
+}
+
+// Version 4 gave tax its own entries, separate from spending. Nothing moves between wallets, so every
+// balance stays exactly as it was.
+function migrateV3(o) {
+  const taken = new Set(o.categories.map((c) => `${c.kind}:${c.name.toLowerCase()}`));
+  const ids = new Set(o.categories.map((c) => c.id));
+  const added = DEFAULT_CATEGORIES.map(defaultCategory).filter(
+    (c) => ['Fees', 'Tax refund'].includes(c.name) && !taken.has(`${c.kind}:${c.name.toLowerCase()}`) && !ids.has(c.id),
+  );
+  const data = {
+    ...o,
+    version: 4,
+    categories: [...o.categories.map((c) => ({ ...c })), ...added],
+    tx: o.tx.map((t) => ({ ...t })),
+    recurring: o.recurring.map((r) => ({ ...r })),
+    taxTypes: [],
+    taxes: [],
+    nbu: {},
+    pendingRates: [],
+  };
+  const counts = liftTaxEntries(data, data.tx);
+  const old = data.categories.find(isTaxesCategory);
+  for (const r of data.recurring) {
+    if (!old || r.categoryId !== old.id) continue;
+    if (FEE_NOTE.test(r.note || '')) {
+      r.categoryId = feesCategory(data).id;
+    } else {
+      r.type = 'tax';
+      r.taxTypeId = taxTypeNamed(data, r.note || 'Other tax', r.walletId).id;
+      delete r.categoryId;
+    }
+  }
+  if (counts.taxes || counts.fees) data.upgradeNotice = counts;
+  return data;
+}
+
 // Throws if the object is not a usable backup, so a bad file can never replace good data.
 // Returns the data in the current format.
 export function validateBackup(input) {
@@ -189,6 +307,14 @@ export function validateBackup(input) {
     if (c.limit !== null && c.limit !== undefined && !isAmount(c.limit)) fail('bad budget limit');
     ids.add(c.id);
   }
+  const taxTypeIds = new Set((o.taxTypes || []).map((x) => x.id));
+  const taxIds = new Set();
+  for (const x of o.taxes || []) {
+    if (!x.id || !isDate(x.date) || !isAmount(x.dueAmount) || !isCurrency(x.currency) || !taxTypeIds.has(x.taxTypeId)) {
+      fail('bad tax');
+    }
+    taxIds.add(x.id);
+  }
   const validForeign = (x) =>
     x.foreignCurrency === undefined || x.foreignCurrency === null || (isCurrency(x.foreignCurrency) && isAmount(x.foreignAmount));
   for (const t of o.tx) {
@@ -198,6 +324,8 @@ export function validateBackup(input) {
       if (!walletIds.has(t.toWalletId) || !isAmount(t.toAmount)) fail('bad transfer');
     } else if (t.type === 'adjustment') {
       if (typeof t.increase !== 'boolean' || !Number.isSafeInteger(t.before)) fail('bad balance correction');
+    } else if (t.type === 'tax') {
+      if (!taxIds.has(t.taxId)) fail('bad tax payment');
     } else if (!isType(t.type) || !ids.has(t.categoryId)) {
       fail('bad transaction');
     }
@@ -211,15 +339,14 @@ export function validateBackup(input) {
       !r.id ||
       !isDate(r.start) ||
       !isAmount(r.amount) ||
-      !isType(r.type) ||
-      !ids.has(r.categoryId) ||
+      !(r.type === 'tax' ? taxTypeIds.has(r.taxTypeId) : isType(r.type) && ids.has(r.categoryId)) ||
       !walletIds.has(r.walletId) ||
       !(r.freq in FREQ_DAYS || r.freq in FREQ_MONTHS)
     ) {
       fail('bad recurring item');
     }
   }
-  return o;
+  return o.version >= 4 ? o : migrateV3(o);
 }
 
 // ---------- Exchange rates ----------
@@ -243,6 +370,46 @@ export function parseRate(input) {
   const s = String(input ?? '').replace(/\s/g, '').replace(',', '.');
   const n = Number(s);
   return s && Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// The official NBU rate on a date when there is one, otherwise today's rate as an estimate.
+// `source` says which, so anything estimated can be corrected once the real rate is known.
+export function rateOn(state, from, to, date) {
+  if (from === to) return { rate: 1, source: 'nbu' };
+  const table = state.nbu?.[date];
+  const inUah = (code) => (code === 'UAH' ? 1 : table?.[code]);
+  if (table && inUah(from) && inUah(to)) return { rate: inUah(from) / inUah(to), source: 'nbu' };
+  const rate = crossRate(state, from, to);
+  return rate ? { rate, source: 'estimate' } : null;
+}
+
+// Into the display currency, at the saved rate for that date when there is one.
+export function convertOn(state, cents, from, date) {
+  const found = rateOn(state, from, state.currency, date);
+  return found ? Math.round(cents * found.rate) : null;
+}
+
+export const nbuUrl = (date) =>
+  `https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json&date=${date.replaceAll('-', '')}`;
+
+// Saves the rates for one date and corrects taxes that were estimated. Paid amounts never change.
+// `rows` is the NBU response. It's empty for a date the NBU hasn't published yet, which stays pending.
+export function applyNbuRates(state, date, rows, codes) {
+  const table = {};
+  for (const row of rows) {
+    if (codes.includes(row.cc) && row.rate > 0) table[row.cc] = row.rate;
+  }
+  if (!rows.length) return false;
+  state.nbu[date] = table;
+  state.pendingRates = state.pendingRates.filter((d) => d !== date);
+  for (const tax of state.taxes) {
+    if (tax.date === date && tax.base && tax.fxSource === 'estimate') setIncomeTaxDue(state, tax);
+  }
+  return true;
+}
+
+export function needRate(state, date) {
+  if (!state.nbu[date] && !state.pendingRates.includes(date)) state.pendingRates.push(date);
 }
 
 // `usdRates` is units of each currency per 1 USD, as the rates service returns them.
@@ -373,6 +540,7 @@ export function plannedEntries(state, monthKey, today) {
       const month = monthOf(date);
       if (month > monthKey) break;
       if (month !== monthKey || date <= today || (rule.lastRun && date <= rule.lastRun)) continue;
+      const amount = ruleCharge(state, rule);
       out.push({
         id: `planned:${rule.id}:${date}`,
         planned: true,
@@ -380,12 +548,27 @@ export function plannedEntries(state, monthKey, today) {
         estimated: Boolean(rule.foreignCurrency && !rule.fixedRate),
         date,
         type: rule.type,
-        amount: ruleCharge(state, rule),
+        amount,
         ...(rule.foreignCurrency && { foreignAmount: rule.foreignAmount, foreignCurrency: rule.foreignCurrency }),
         walletId: rule.walletId,
-        categoryId: rule.categoryId,
+        ...(rule.type === 'tax' ? { taxTypeId: rule.taxTypeId } : { categoryId: rule.categoryId }),
         note: rule.note,
       });
+      if (rule.type !== 'income') continue;
+      for (const type of linkedTaxTypes(state, rule.walletId)) {
+        out.push({
+          id: `planned:${rule.id}:${date}:${type.id}`,
+          planned: true,
+          ruleId: rule.id,
+          estimated: true,
+          date,
+          type: 'tax',
+          amount: Math.max(1, Math.round((amount * type.rate) / 100)),
+          walletId: rule.walletId,
+          taxTypeId: type.id,
+          note: '',
+        });
+      }
     }
   }
   return out;
@@ -397,22 +580,199 @@ export function applyRecurring(state, today) {
   for (const rule of state.recurring) {
     for (let date = nextOccurrence(rule); date <= today; date = nextOccurrence(rule)) {
       rule.amount = ruleCharge(state, rule);
-      state.tx.push({
-        id: uid(),
-        date,
-        type: rule.type,
-        amount: rule.amount,
-        ...(rule.foreignCurrency && { foreignAmount: rule.foreignAmount, foreignCurrency: rule.foreignCurrency }),
-        walletId: rule.walletId,
-        categoryId: rule.categoryId,
-        note: rule.note,
-        recurringId: rule.id,
-      });
+      if (rule.type === 'tax') {
+        // A tax waits in Tax to pay. The wallet only changes when it's paid.
+        state.taxes.push({
+          id: uid(),
+          taxTypeId: rule.taxTypeId,
+          date,
+          dueAmount: rule.foreignCurrency ? rule.foreignAmount : rule.amount,
+          currency: rule.foreignCurrency || state.wallets.find((w) => w.id === rule.walletId).currency,
+          walletId: rule.walletId,
+          ruleId: rule.id,
+          ...(rule.fixedRate && { payRate: rule.fixedRate }),
+          note: rule.note,
+        });
+      } else {
+        const entry = {
+          id: uid(),
+          date,
+          type: rule.type,
+          amount: rule.amount,
+          ...(rule.foreignCurrency && { foreignAmount: rule.foreignAmount, foreignCurrency: rule.foreignCurrency }),
+          walletId: rule.walletId,
+          categoryId: rule.categoryId,
+          note: rule.note,
+          recurringId: rule.id,
+        };
+        state.tx.push(entry);
+        if (rule.type === 'income') {
+          for (const type of linkedTaxTypes(state, rule.walletId)) addIncomeTax(state, entry, type.id, type.rate);
+        }
+      }
       rule.lastRun = date;
       added++;
     }
   }
   return added;
+}
+
+// ---------- Tax ----------
+
+// Percentage taxes suggested for income in a wallet.
+export const linkedTaxTypes = (state, walletId) =>
+  state.taxTypes.filter((x) => x.mode === 'percent' && !x.archived && x.rate > 0 && x.walletIds.includes(walletId));
+
+const walletCurrencyOf = (state, id) => state.wallets.find((w) => w.id === id).currency;
+
+// Works out a percentage tax. The tax is calculated in the tax type's currency at the rate on the
+// income date. Once money has been paid, the currency stays so the payments still compare.
+export function setIncomeTaxDue(state, tax) {
+  if (tax.fxSource !== 'manual') {
+    const type = state.taxTypes.find((x) => x.id === tax.taxTypeId);
+    const hasPayments = state.tx.some((t) => t.type === 'tax' && t.taxId === tax.id);
+    const target = hasPayments ? tax.currency : type.currency;
+    const found = rateOn(state, tax.baseCurrency, target, tax.date);
+    tax.currency = found ? target : tax.baseCurrency;
+    tax.fx = found ? found.rate : 1;
+    tax.fxSource = found ? found.source : 'estimate';
+  }
+  tax.dueAmount = Math.max(1, Math.round((tax.base * tax.fx * tax.rate) / 100));
+}
+
+export function addIncomeTax(state, income, taxTypeId, rate) {
+  const tax = {
+    id: uid(),
+    taxTypeId,
+    date: income.date,
+    incomeId: income.id,
+    rate,
+    base: income.amount,
+    baseCurrency: walletCurrencyOf(state, income.walletId),
+    walletId: income.walletId,
+    currency: walletCurrencyOf(state, income.walletId),
+    dueAmount: 1,
+    note: '',
+  };
+  setIncomeTaxDue(state, tax);
+  state.taxes.push(tax);
+  if (tax.fxSource === 'estimate') needRate(state, income.date);
+  return tax;
+}
+
+export const taxPayments = (state, taxId) => state.tx.filter((t) => t.type === 'tax' && t.taxId === taxId);
+
+// A payment's value in the tax's own currency. A wallet in another currency saves it when paying.
+export function paymentInTaxCurrency(state, payment, tax) {
+  if (walletCurrencyOf(state, payment.walletId) === tax.currency) return payment.amount;
+  if (payment.foreignCurrency === tax.currency) return payment.foreignAmount;
+  const found = rateOn(state, walletCurrencyOf(state, payment.walletId), tax.currency, payment.date);
+  return found ? Math.round(payment.amount * found.rate) : 0;
+}
+
+// What should be paid against what was. A difference is only recorded: it doesn't carry to another tax.
+export function taxStatus(state, tax) {
+  const payments = taxPayments(state, tax.id);
+  const paid = payments.reduce((sum, p) => sum + paymentInTaxCurrency(state, p, tax), 0);
+  const baseInTax = tax.base ? tax.base * tax.fx : null;
+  return {
+    payments,
+    paid,
+    remaining: Math.max(0, tax.dueAmount - paid),
+    difference: paid - tax.dueAmount,
+    settled: paid >= tax.dueAmount,
+    paidPercent: baseInTax && paid ? (paid / baseInTax) * 100 : null,
+  };
+}
+
+export const unpaidTaxes = (state) =>
+  state.taxes.filter((x) => !taxStatus(state, x).settled).sort((a, b) => a.date.localeCompare(b.date));
+
+// Taxes belong to the month of their income or due date, whenever they get paid.
+export function monthTaxes(state, key) {
+  const out = { paid: 0, unpaid: 0, missing: new Set(), converted: false, byType: new Map() };
+  const count = (field, cents, currency, date, typeId) => {
+    const value = convertOn(state, cents, currency, date);
+    if (value === null) {
+      out.missing.add(currency);
+      return;
+    }
+    if (currency !== state.currency) out.converted = true;
+    out[field] += value;
+    out.byType.set(typeId, (out.byType.get(typeId) || 0) + value);
+  };
+  for (const tax of state.taxes) {
+    if (monthOf(tax.date) !== key) continue;
+    const status = taxStatus(state, tax);
+    for (const p of status.payments) count('paid', p.amount, walletCurrencyOf(state, p.walletId), p.date, tax.taxTypeId);
+    if (status.remaining) count('unpaid', status.remaining, tax.currency, tax.date, tax.taxTypeId);
+  }
+  return out;
+}
+
+// Keeps an income's taxes in step after saving it. `choices` maps a tax type to its percentage, or
+// to null when unticked. Unpaid taxes follow the income. Paid ones keep their payments and show the
+// new difference, and one that has been paid isn't removed.
+export function syncIncomeTaxes(state, income, choices) {
+  for (const tax of state.taxes.filter((x) => x.incomeId === income.id)) {
+    const paid = taxPayments(state, tax.id).length > 0;
+    const rate = choices[tax.taxTypeId];
+    if (rate === null && !paid) {
+      state.taxes = state.taxes.filter((x) => x !== tax);
+      continue;
+    }
+    if (rate) tax.rate = rate;
+    tax.date = income.date;
+    tax.base = income.amount;
+    if (!paid) {
+      tax.baseCurrency = walletCurrencyOf(state, income.walletId);
+      tax.walletId = income.walletId;
+    }
+    setIncomeTaxDue(state, tax);
+    if (tax.fxSource === 'estimate') needRate(state, tax.date);
+  }
+  for (const [taxTypeId, rate] of Object.entries(choices)) {
+    if (rate && !state.taxes.some((x) => x.incomeId === income.id && x.taxTypeId === taxTypeId)) {
+      addIncomeTax(state, income, taxTypeId, rate);
+    }
+  }
+}
+
+// When an income goes away. Unpaid taxes can go with it. Money already paid really left the wallet,
+// so those stay, and so does everything when `keep` is true: they just stop following an income.
+export function detachIncomeTaxes(state, incomeId, keep) {
+  for (const tax of state.taxes.filter((x) => x.incomeId === incomeId)) {
+    if (!keep && !taxPayments(state, tax.id).length) {
+      state.taxes = state.taxes.filter((x) => x !== tax);
+      continue;
+    }
+    delete tax.incomeId;
+  }
+}
+
+export function addTaxPayment(state, tax, { walletId, amount, taxAmount, date, note }) {
+  const payment = { id: uid(), date, type: 'tax', amount, walletId, taxId: tax.id, note: note || '' };
+  if (walletCurrencyOf(state, walletId) !== tax.currency) {
+    payment.foreignAmount = taxAmount;
+    payment.foreignCurrency = tax.currency;
+  }
+  state.tx.push(payment);
+  return payment;
+}
+
+// Pays what's left at the rate for that date. Returns how many it paid. A tax with no rate is left alone.
+export function payAllTaxes(state, date, walletFor) {
+  let paid = 0;
+  for (const tax of unpaidTaxes(state)) {
+    const walletId = walletFor(tax);
+    const taxAmount = taxStatus(state, tax).remaining;
+    const currency = walletCurrencyOf(state, walletId);
+    const rate = tax.payRate && currency !== tax.currency ? { rate: tax.payRate } : rateOn(state, tax.currency, currency, date);
+    if (!rate) continue;
+    addTaxPayment(state, tax, { walletId, amount: Math.max(1, Math.round(taxAmount * rate.rate)), taxAmount, date });
+    paid++;
+  }
+  return paid;
 }
 
 // ---------- Aggregates ----------
@@ -426,16 +786,22 @@ export const txInMonth = (txs, key) => txs.filter((t) => monthOf(t.date) === key
 // the record, so neither counts as income or spending.
 export function summarize(state, txs) {
   const currencies = new Map(state.wallets.map((w) => [w.id, w.currency]));
-  const out = { income: 0, expense: 0, byCategory: new Map(), missing: new Set(), converted: false };
+  const out = { income: 0, expense: 0, plannedTax: 0, byCategory: new Map(), missing: new Set(), converted: false };
   for (const t of txs) {
     if (t.type === 'transfer' || t.type === 'adjustment') continue;
+    // Tax payments count for the tax's own month (see monthTaxes). Planned ones have no such record yet.
+    if (t.type === 'tax' && !t.planned) continue;
     const from = currencies.get(t.walletId);
-    const value = convert(state, t.amount, from);
+    const value = convertOn(state, t.amount, from, t.date);
     if (value === null) {
       out.missing.add(from);
       continue;
     }
     if (from !== state.currency) out.converted = true;
+    if (t.type === 'tax') {
+      out.plannedTax += value;
+      continue;
+    }
     out[t.type] += value;
     if (t.type === 'expense') out.byCategory.set(t.categoryId, (out.byCategory.get(t.categoryId) || 0) + value);
   }
@@ -450,8 +816,9 @@ export function trend(state, endKey, months, today = null) {
     const planned = Boolean(today) && key > monthOf(today);
     const list = txInMonth(state.tx, key);
     if (planned) list.push(...plannedEntries(state, key, today));
-    const { income, expense } = summarize(state, list);
-    rows.push({ key, income, expense, planned });
+    const { income, expense, plannedTax } = summarize(state, list);
+    const taxes = monthTaxes(state, key);
+    rows.push({ key, income, expense, planned, taxPaid: taxes.paid, taxUnpaid: taxes.unpaid, taxPlanned: plannedTax, tax: taxes.paid + taxes.unpaid + plannedTax });
   }
   return rows;
 }
@@ -537,6 +904,11 @@ const csvCell = (v) => {
 const guardFormula = (s) => (/^[=+\-@\t\r]/.test(s) ? `'${s}` : s);
 const unguardFormula = (s) => (/^'[=+\-@\t\r]/.test(s) ? s.slice(1) : s);
 
+function taxTypeNameOf(state, payment) {
+  const tax = state.taxes.find((x) => x.id === payment.taxId);
+  return state.taxTypes.find((x) => x.id === tax.taxTypeId).name;
+}
+
 export function toCSV(state) {
   const names = new Map(state.categories.map((c) => [c.id, c.name]));
   const wallets = new Map(state.wallets.map((w) => [w.id, w]));
@@ -550,7 +922,7 @@ export function toCSV(state) {
       guardFormula(from.name),
       ((t.type === 'adjustment' && !t.increase ? -t.amount : t.amount) / 100).toFixed(2),
       from.currency,
-      guardFormula(names.get(t.categoryId) || ''),
+      guardFormula(t.type === 'tax' ? taxTypeNameOf(state, t) : names.get(t.categoryId) || ''),
       guardFormula(t.note || ''),
       to ? guardFormula(to.name) : '',
       to ? (t.toAmount / 100).toFixed(2) : '',
@@ -654,6 +1026,7 @@ const INCOME_WORDS = /inc|credit|earn|revenue|salary|deposit|дох/i;
 const EXPENSE_WORDS = /exp|debit|spend|cost|payment|витр/i;
 const TRANSFER_WORDS = /transfer|переказ/i;
 const CORRECTION_WORDS = /adjust|correction|reconcil/i;
+const TAX_WORDS = /^tax$/i;
 
 // Names from other apps, mapped onto this app's English categories. Keys are lower case.
 const CATEGORY_NAMES = new Map(Object.entries({
@@ -887,14 +1260,17 @@ export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId
       continue;
     }
 
+    const isTax = TAX_WORDS.test(typeCell);
     let type;
-    if (INCOME_WORDS.test(typeCell)) type = 'income';
+    if (isTax) type = 'expense';
+    else if (INCOME_WORDS.test(typeCell)) type = 'income';
     else if (EXPENSE_WORDS.test(typeCell)) type = 'expense';
     else if (hasNegatives) type = amount < 0 ? 'expense' : 'income';
     else type = 'expense';
 
-    const name =
-      translated(categoryCell, CATEGORY_NAMES) || (type === 'income' ? 'Other income' : 'Other');
+    const name = isTax
+      ? 'Taxes'
+      : translated(categoryCell, CATEGORY_NAMES) || (type === 'income' ? 'Other income' : 'Other');
     const key = `${type}:${name.toLowerCase()}`;
     if (!known.has(key)) {
       const id = uid();
@@ -911,6 +1287,8 @@ export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId
       walletId: wallet.id,
       categoryId: known.get(key),
       note: unguardFormula(cell(row, 'note')),
+      // A tax exported by this app has its type in the category column.
+      ...(isTax && { taxName: categoryCell }),
     });
   }
 
@@ -941,6 +1319,21 @@ export function buildImport(rows, map, fmt, categories, wallets, defaultWalletId
     transfersMatched: pairs.length,
     transfersToClosed: unpairedOut.length + unpairedIn.length,
   };
+}
+
+// Moves imported tax entries out of spending, the same way the upgrade to version 4 does.
+export function liftImportedTaxes(state, built) {
+  const data = {
+    categories: [...state.categories, ...built.newCategories],
+    wallets: [...state.wallets, ...built.newWallets],
+    taxTypes: [...state.taxTypes],
+    taxes: [],
+  };
+  liftTaxEntries(data, built.tx);
+  built.newCategories = data.categories.filter((c) => !state.categories.includes(c));
+  built.newTaxTypes = data.taxTypes.filter((x) => !state.taxTypes.includes(x));
+  built.taxes = data.taxes;
+  return built;
 }
 
 // What a built import would repeat. Each existing entry can only match one imported entry, so two
