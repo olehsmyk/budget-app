@@ -1066,9 +1066,8 @@ function sheetTaxes() {
 
 const taxedWalletIds = () => [...new Set(activeTaxTypes().filter((x) => x.mode === 'percent').flatMap((x) => x.walletIds))];
 
-function currentSummary(s) {
-  return C.yearSummary(state, s.year, { currency: s.currency, walletIds: s.scope === 'taxed' ? taxedWalletIds() : null });
-}
+const summaryOptions = (s) => ({ currency: s.currency, walletIds: s.scope === 'taxed' ? taxedWalletIds() : null });
+const currentSummary = (s) => C.yearSummary(state, s.year, summaryOptions(s));
 
 function summaryTable(title, rows) {
   return html`<table class="table">
@@ -1611,7 +1610,7 @@ function sheetRule(s) {
       </div>
       <p class="small">${f.type === 'tax'
         ? 'Each one waits in Tax to pay, even with no income. The wallet changes only when you pay it. A first date in the past adds all of them since then.'
-        : `A first date in the past adds all the entries since then${f.foreign ? ", all at today's rate" : ''}.`}</p>
+        : `A first date in the past adds all the entries since then${f.foreign ? ', each at the official rate for its date when the app has one, otherwise today\'s' : ''}.`}</p>
       ${s.id && html`<button class="btn btn-danger" data-a="deleteRule">Stop repeating</button>
         <p class="small">Entries already added stay in your history.</p>`}
     </div>`;

@@ -1394,3 +1394,13 @@ test('the first year with data limits how far back a summary goes', () => {
   assert.equal(C.firstDataYear(summaryState(), '2026'), '2025');
   assert.equal(C.firstDataYear(C.defaultState('2026-01-01'), '2026'), '2026');
 });
+
+test('a recurring payment missed while the app was closed uses the rate of its due date', (t) => {
+  C.setRateHistory({ start: '2026-10-01', rates: { USD: new Array(60).fill(40).map((r, i) => (i < 30 ? 40 : 44)), EUR: new Array(60).fill(50) } });
+  t.after(() => C.setRateHistory(null));
+  const state = multiCurrencyState(); // today's rate: 1 USD = 0.9 EUR
+  state.recurring.push(foreignRule({ start: '2026-10-15' }));
+  C.applyRecurring(state, '2026-11-20');
+  assert.deepEqual(state.tx.map((x) => [x.date, x.amount]), [['2026-10-15', Math.round(2000 * 40 / 50)], ['2026-11-15', Math.round(2000 * 44 / 50)]]);
+  assert.equal(C.ruleCharge(state, state.recurring[0]), 1800, 'without a date it is still today\'s rate');
+});

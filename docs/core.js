@@ -536,11 +536,14 @@ export function nextOccurrence(rule) {
 }
 
 // What a rule takes from its wallet, in the wallet's currency. A foreign price uses the rule's own
-// rate if it has one, then the current rate. With neither, the last charge is the best estimate left.
-export function ruleCharge(state, rule) {
+// rate if it has one, then the official rate on `date`, then the current rate. With none of them, the
+// last charge is the best estimate left.
+export function ruleCharge(state, rule, date = null) {
   if (!rule.foreignCurrency) return rule.amount;
   const currency = state.wallets.find((w) => w.id === rule.walletId).currency;
-  const rate = rule.fixedRate || crossRate(state, rule.foreignCurrency, currency);
+  const rate =
+    rule.fixedRate ||
+    (date ? rateOn(state, rule.foreignCurrency, currency, date)?.rate : crossRate(state, rule.foreignCurrency, currency));
   return rate ? Math.max(1, Math.round(rule.foreignAmount * rate)) : rule.amount;
 }
 
@@ -593,7 +596,8 @@ export function applyRecurring(state, today) {
   let added = 0;
   for (const rule of state.recurring) {
     for (let date = nextOccurrence(rule); date <= today; date = nextOccurrence(rule)) {
-      rule.amount = ruleCharge(state, rule);
+      // A payment missed while the app was closed still uses the rate of the day it was due.
+      rule.amount = ruleCharge(state, rule, date);
       if (rule.type === 'tax') {
         // A tax waits in Tax to pay. The wallet only changes when it's paid.
         state.taxes.push({
@@ -729,6 +733,29 @@ export function monthTaxes(state, key, target = state.currency) {
 
 const isRefundCategory = (c) => c?.kind === 'income' && c.name.toLowerCase() === 'tax refund';
 
+// Each income counted in a year's summary, with the rate that turned it into `currency`.
+export function yearIncomes(state, year, { currency = state.currency, walletIds = null } = {}) {
+  const categories = new Map(state.categories.map((c) => [c.id, c]));
+  const currencies = new Map(state.wallets.map((w) => [w.id, w.currency]));
+  const out = [];
+  for (const t of sortTx(state.tx).reverse()) {
+    if (t.type !== 'income' || !t.date.startsWith(`${year}-`)) continue;
+    const refund = isRefundCategory(categories.get(t.categoryId));
+    if (!refund && walletIds && !walletIds.includes(t.walletId)) continue;
+    const from = currencies.get(t.walletId);
+    const found = rateOn(state, from, currency, t.date);
+    out.push({
+      tx: t,
+      refund,
+      currency: from,
+      rate: found?.rate ?? null,
+      source: found?.source ?? null,
+      value: found ? Math.round(t.amount * found.rate) : null,
+    });
+  }
+  return out;
+}
+
 // One year of income and tax by month, quarter and in total, in one currency. `walletIds` limits the
 // income counted, so money that isn't taxed can stay out of it. Refunds are listed on their own.
 // Quarters and the year are added up from the months, so the numbers on screen always add up.
@@ -737,20 +764,13 @@ export function yearSummary(state, year, { currency = state.currency, walletIds 
   const months = Array.from({ length: 12 }, (_, i) => blank(`${year}-${pad(i + 1)}`));
   const missing = new Set();
   let estimated = 0;
-  const categories = new Map(state.categories.map((c) => [c.id, c]));
-  const currencies = new Map(state.wallets.map((w) => [w.id, w.currency]));
-  for (const t of state.tx) {
-    if (t.type !== 'income' || !t.date.startsWith(`${year}-`)) continue;
-    const refund = isRefundCategory(categories.get(t.categoryId));
-    if (!refund && walletIds && !walletIds.includes(t.walletId)) continue;
-    const from = currencies.get(t.walletId);
-    const found = rateOn(state, from, currency, t.date);
-    if (!found) {
-      missing.add(from);
+  for (const item of yearIncomes(state, year, { currency, walletIds })) {
+    if (item.value === null) {
+      missing.add(item.currency);
       continue;
     }
-    if (found.source !== 'nbu') estimated++;
-    months[Number(t.date.slice(5, 7)) - 1][refund ? 'refund' : 'income'] += Math.round(t.amount * found.rate);
+    if (item.source !== 'nbu') estimated++;
+    months[Number(item.tx.date.slice(5, 7)) - 1][item.refund ? 'refund' : 'income'] += item.value;
   }
   for (const m of months) {
     const taxes = monthTaxes(state, m.label, currency);
